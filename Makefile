@@ -32,7 +32,7 @@ $(BUILD_DIR)/vendor/cjson/%.o: vendor/cjson/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 check: $(TARGET)
-	CEROTTO_BIN="$(abspath $(TARGET))" python3 tests/test_cerotto.py
+	CEROTTO_BIN="$(abspath $(TARGET))" python3 -m unittest discover -v -s tests -p 'test_*.py'
 
 sanitize:
 	$(MAKE) BUILD_DIR=build/sanitize CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -fno-omit-frame-pointer -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" all
