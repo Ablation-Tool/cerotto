@@ -1,13 +1,3 @@
-<p align="center">
-  <img src="assets/branding/cerotto-wordmark.svg" width="640" alt="CEROTTO">
-</p>
-
-<p align="center">
-  <a href="https://github.com/Ablation-Tool/cerotto/actions/workflows/ci.yml"><img src="https://github.com/Ablation-Tool/cerotto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.4.0-grey" alt="Version 0.4.0">
-  <img src="https://img.shields.io/badge/language-C11-grey" alt="C11">
-  <img src="https://img.shields.io/badge/platform-Linux-grey" alt="Linux">
-</p>
 
 CEROTTO investigates attacks involving autonomous AI agents and sandbox escapes.
 
