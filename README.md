@@ -17,7 +17,7 @@ It connects prompts and tool calls to processes, files, network activity, and di
 ---
 
 
-CEROTTO is a DFIR (Digital Forensics and Incident Response) tool, built for a modern problem: investigating AI agents.
+CEROTTO is a Digital Forensics and Incident Response tool, built for a modern problem: investigating AI agents.
 
 
 Traditional DFIR tools answer: "A hacker or malware got onto this server—what files did they touch and what commands did they run?"
