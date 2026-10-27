@@ -1,18 +1,6 @@
-
-CEROTTO is a Digital Forensics and Incident Response tool, built for a modern problem: investigating AI agents.
-
-
-Traditional DFIR tools answer: "A hacker or malware got onto this server and what files did they touch and what commands did they run?"
-
-
-CEROTTO answers: "An autonomous AI agent was given access to a computer and what did the user ask it, what tools did the agent decide to call, and what actually happened on the operating system as a result?"
-
----
-
-
 CEROTTO is designed to investigate the attacks conducted by autonomous agents.                                                                                                  
                                                                                                                                                                                                                   
-  CEROTTO helps you reconstruct:                                                                                                 
+  Reconstruct:                                                                                                 
                                                                                                                                                                                                                   
    • What the user asked the agent to do.                                                                                                                                                                         
    • Which tools the agent invoked.                                                                                                                                                                               
@@ -20,10 +8,8 @@ CEROTTO is designed to investigate the attacks conducted by autonomous agents.
    • Which files were accessed, created, or deleted.                                                                                                                                                              
    • Which network connections were made.                                                                                                                                                                         
                                                                                                                                                                                                                   
-   It takes agent logs, Linux audit records, and disk evidence and combines them into one reviewable timeline. An optional AI assistant can summarize that timeline, but its observations and hypotheses must cite
-   supporting events—and the assistant cannot run commands on the host.                                                                                                                                           
                                                                                                                                                                                                                   
-   CEROTTO can help investigate:                                                                                                                                                                                  
+   Investigate:                                                                                                                                                                                  
                                                                                                                                                                                                                   
    • Prompt injection: A malicious document or website instructs an agent to ignore its original task.                                                                                                            
    • Tool abuse: The agent invokes shell, filesystem, browser, or MCP tools in unexpected ways.                                                                                                                   
