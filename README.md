@@ -116,16 +116,6 @@ Paths and identifiers remain untrusted evidence and may contain hostile text. Re
 
 </details>
 
-<details>
-<summary><strong>What CEROTTO does not do</strong></summary>
-
-- It does not prevent prompt injection or replace agent sandboxing and access controls.
-- It does not configure auditd or provide live containment.
-- It does not give the LLM direct host access or execute model suggestions.
-- It does not prove that a prompt caused a host event merely because one preceded the other.
-- It does not currently provide natural-language queries, fleet-wide analysis, incident-similarity graphs, AFF/EWF acquisition, carving, Chkrootkit, or Volatility integration.
-
-</details>
 
 ---
 
