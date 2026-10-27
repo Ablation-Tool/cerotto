@@ -10,9 +10,9 @@ CEROTTO answers: "An autonomous AI agent was given access to a computer and what
 ---
 
 
-CEROTTO is designed for the investigation problems created by LLM attacks and increasingly autonomous agents.                                                                                                  
+CEROTTO is designed to investigate the attacks conducted by autonomous agents.                                                                                                  
                                                                                                                                                                                                                   
-   If an AI agent was allowed to use a computer and something suspicious happened, CEROTTO helps you reconstruct:                                                                                                 
+  CEROTTO helps you reconstruct:                                                                                                 
                                                                                                                                                                                                                   
    • What the user asked the agent to do.                                                                                                                                                                         
    • Which tools the agent invoked.                                                                                                                                                                               
@@ -31,21 +31,9 @@ CEROTTO is designed for the investigation problems created by LLM attacks and in
    • Agent-driven hacking: An autonomous system runs scans, scripts, exploits, or persistence mechanisms on a host.                                                                                               
    • Compromised toolchains: Suspicious agent activity is followed by deleted files, modified configurations, or unusual processes.                                                                               
                                                                                                                                                                                                                   
-   A typical investigation might look like:                                                                                                                                                                       
-                                                                                                                                                                                                                  
-   ```text                                                                                                                                                                                                        
-     Malicious instructions                                                                                                                                                                                       
-             ↓                                                                                                                                                                                                    
-     Agent invokes a shell tool                                                                                                                                                                                   
-             ↓                                                                                                                                                                                                    
-     A process starts                                                                                                                                                                                             
-             ↓                                                                                                                                                                                                    
-     A script accesses credentials or sensitive files                                                                                                                                                             
-             ↓                                                                                                                                                                                                    
-     The script is deleted                                                                                                                                                                                        
-             ↓                                                                                                                                                                                                    
-     An outbound connection is made                                                                                                                                                                               
-   ```                                                                                                                                                                                                            
+
+                                                                                                                                                                                                        
+                                                                                                                                                                                                        
                                                                                                                                                                                                                   
    CEROTTO helps responders see and verify that sequence without manually searching thousands of unrelated log lines. They can determine how much of the suspected attack is supported by evidence rather than    
    blaming the model based on timing or suspicious output alone.                                                                                                                                                  
@@ -63,4 +51,3 @@ CEROTTO is designed for the investigation problems created by LLM attacks and in
                                                                                                                                                                                                                   
    CEROTTO is therefore not an anti-jailbreak tool or an autonomous hacking platform. It is an incident-response and evidence-correlation layer for a world where AI agents can take real actions on real systems.
                                                                                                                                                                                                                   
-   In one sentence: CEROTTO helps you understand what an AI agent actually did on a computer. 
