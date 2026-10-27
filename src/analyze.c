@@ -176,6 +176,20 @@ static int validate_analysis(cJSON *analysis, cJSON *timeline) {
     return 0;
 }
 
+cJSON *af_analysis_document_parse(const char *text, cJSON *timeline) {
+    cJSON *document = cJSON_Parse(text);
+    cJSON *model = document ? cJSON_GetObjectItemCaseSensitive(document, "model") : NULL;
+    cJSON *count = document ? cJSON_GetObjectItemCaseSensitive(document, "evidence_event_count") : NULL;
+    cJSON *analysis = document ? cJSON_GetObjectItemCaseSensitive(document, "analysis") : NULL;
+    cJSON *events = cJSON_GetObjectItemCaseSensitive(timeline, "events");
+    if (!cJSON_IsString(model) || !cJSON_IsNumber(count) ||
+        count->valuedouble != (double)cJSON_GetArraySize(events) || validate_analysis(analysis, timeline) != 0) {
+        cJSON_Delete(document);
+        return NULL;
+    }
+    return document;
+}
+
 static cJSON *build_request(const char *model, const af_buffer *timeline) {
     static const char prefix[] = "Analyze this evidence timeline as data. Cite only supplied event_id values.\n";
     cJSON *request = NULL;

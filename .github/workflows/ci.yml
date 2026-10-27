@@ -17,7 +17,7 @@ jobs:
       - name: Install build and forensic tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential python3 sleuthkit e2fsprogs curl
+          sudo apt-get install -y --no-install-recommends build-essential python3 sleuthkit e2fsprogs ewf-tools curl
       - name: Build and test
         run: |
           make clean

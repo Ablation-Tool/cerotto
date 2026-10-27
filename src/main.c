@@ -3,6 +3,8 @@
 #include "collect.h"
 #include "db.h"
 #include "event.h"
+#include "manifest.h"
+#include "report.h"
 #include "timeline.h"
 #include "util.h"
 
@@ -11,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VERSION "0.2.0"
+#define VERSION "0.3.0"
 
 typedef struct {
     const char *db;
@@ -23,6 +25,11 @@ typedef struct {
     const char *conversation;
     const char *from;
     const char *to;
+    const char *analysis;
+    const char *format;
+    const char *reviewer;
+    const char *review_status;
+    const char *base;
     size_t limit;
     int include_details;
 } options;
@@ -35,8 +42,12 @@ static void usage(FILE *output) {
         "  cerotto ingest --db DB --case CASE --input EVENTS.jsonl\n"
         "  cerotto ingest-audit --db DB --case CASE --input AUDIT.log --host HOST\n"
         "  cerotto collect-tsk --db DB --case CASE --image IMAGE --output DIR --host HOST\n"
+        "  cerotto collect-ewf --db DB --case CASE --image evidence.E01 --output DIR --host HOST\n"
         "  cerotto timeline --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--include-details] [--output FILE]\n"
-        "  cerotto analyze --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--output FILE]\n\n"
+        "  cerotto analyze --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--output FILE]\n"
+        "  cerotto manifest --db DB --case CASE [--output FILE]\n"
+        "  cerotto verify --db DB --case CASE [--base DIR] [--output FILE]\n"
+        "  cerotto report --db DB --case CASE --conversation ID [--analysis FILE] [--format json|markdown] [--reviewer NAME --review-status STATUS] [--output FILE]\n\n"
         "Timestamps must be ISO-8601 UTC, for example 2026-10-27T12:00:00Z.\n"
         "Analysis requires CEROTTO_BASE_URL and CEROTTO_MODEL.\n"
         "The base URL is the OpenAI-compatible prefix before /chat/completions.\n",
@@ -66,6 +77,8 @@ static int parse_options(int argc, char **argv, options *parsed) {
     int index;
     memset(parsed, 0, sizeof(*parsed));
     parsed->limit = 10000;
+    parsed->format = "markdown";
+    parsed->review_status = "unreviewed";
     for (index = 0; index < argc; ++index) {
         const char *name = argv[index];
         const char *value = NULL;
@@ -87,6 +100,11 @@ static int parse_options(int argc, char **argv, options *parsed) {
         else if (strcmp(name, "--conversation") == 0) parsed->conversation = value;
         else if (strcmp(name, "--from") == 0) parsed->from = value;
         else if (strcmp(name, "--to") == 0) parsed->to = value;
+        else if (strcmp(name, "--analysis") == 0) parsed->analysis = value;
+        else if (strcmp(name, "--format") == 0) parsed->format = value;
+        else if (strcmp(name, "--reviewer") == 0) parsed->reviewer = value;
+        else if (strcmp(name, "--review-status") == 0) parsed->review_status = value;
+        else if (strcmp(name, "--base") == 0) parsed->base = value;
         else if (strcmp(name, "--limit") == 0) {
             char *end;
             unsigned long limit;
@@ -104,7 +122,8 @@ static int parse_options(int argc, char **argv, options *parsed) {
     }
     if (!parsed->db || (parsed->case_id && !valid_id(parsed->case_id)) ||
         (parsed->host && !valid_id(parsed->host)) ||
-        (parsed->conversation && !valid_id(parsed->conversation))) {
+        (parsed->conversation && !valid_id(parsed->conversation)) ||
+        (parsed->reviewer && !valid_id(parsed->reviewer))) {
         af_error("a database and valid case, host, and conversation identifiers are required");
         return -1;
     }
@@ -199,18 +218,19 @@ cleanup:
     return result == 0 ? 0 : 1;
 }
 
-static int command_collect(const options *parsed) {
+static int command_collect(const options *parsed, int ewf) {
     af_db db;
     size_t count = 0;
     int result;
     if (!parsed->case_id || !parsed->image || !parsed->output || !parsed->host) {
-        af_error("collect-tsk requires --case, --image, --output, and --host");
+        af_error("%s requires --case, --image, --output, and --host", ewf ? "collect-ewf" : "collect-tsk");
         return 1;
     }
     if (open_database(parsed, &db) != 0) {
         return 1;
     }
-    result = af_collect_tsk(&db, parsed->case_id, parsed->image, parsed->output, parsed->host, &count);
+    result = ewf ? af_collect_ewf(&db, parsed->case_id, parsed->image, parsed->output, parsed->host, &count)
+                 : af_collect_tsk(&db, parsed->case_id, parsed->image, parsed->output, parsed->host, &count);
     af_db_close(&db);
     if (result == 0) {
         printf("{\"events_collected\":%zu}\n", count);
@@ -223,7 +243,7 @@ static int prepare_timeline(const options *parsed, af_timeline_query *query,
                             char from[AF_TIMESTAMP_SIZE], char to[AF_TIMESTAMP_SIZE]) {
     memset(query, 0, sizeof(*query));
     if (!parsed->case_id || !parsed->conversation) {
-        af_error("timeline and analyze require --case and --conversation");
+        af_error("timeline, analyze, and report require --case and --conversation");
         return -1;
     }
     if (parsed->from && af_timestamp_normalize(parsed->from, from) != 0) {
@@ -284,6 +304,64 @@ static int command_timeline(const options *parsed, int analyze) {
     return result == 0 ? 0 : 1;
 }
 
+static int command_case_output(const options *parsed, int verify) {
+    af_db db;
+    FILE *output = stdout;
+    int result;
+    if (!parsed->case_id) {
+        af_error("%s requires --case", verify ? "verify" : "manifest");
+        return 1;
+    }
+    if (open_database(parsed, &db) != 0) {
+        return 1;
+    }
+    if (parsed->output) {
+        output = fopen(parsed->output, "wb");
+        if (!output) {
+            af_error("cannot open output %s: %s", parsed->output, strerror(errno));
+            af_db_close(&db);
+            return 1;
+        }
+    }
+    result = verify ? af_verify_case(&db, parsed->case_id, parsed->base, output)
+                    : af_manifest_write(&db, parsed->case_id, output);
+    if (output != stdout && fclose(output) != 0) {
+        result = -1;
+    }
+    af_db_close(&db);
+    return result == 0 ? 0 : 1;
+}
+
+static int command_report(const options *parsed) {
+    af_db db;
+    af_timeline_query query;
+    char from[AF_TIMESTAMP_SIZE];
+    char to[AF_TIMESTAMP_SIZE];
+    FILE *output = stdout;
+    int result;
+    if (prepare_timeline(parsed, &query, from, to) != 0) {
+        return 1;
+    }
+    if (open_database(parsed, &db) != 0) {
+        return 1;
+    }
+    if (parsed->output) {
+        output = fopen(parsed->output, "wb");
+        if (!output) {
+            af_error("cannot open output %s: %s", parsed->output, strerror(errno));
+            af_db_close(&db);
+            return 1;
+        }
+    }
+    result = af_report_write(&db, &query, parsed->analysis, parsed->format,
+                             parsed->reviewer, parsed->review_status, output);
+    if (output != stdout && fclose(output) != 0) {
+        result = -1;
+    }
+    af_db_close(&db);
+    return result == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     options parsed;
     const char *command;
@@ -310,9 +388,13 @@ int main(int argc, char **argv) {
     }
     if (strcmp(command, "ingest") == 0) return command_ingest(&parsed, 0);
     if (strcmp(command, "ingest-audit") == 0) return command_ingest(&parsed, 1);
-    if (strcmp(command, "collect-tsk") == 0) return command_collect(&parsed);
+    if (strcmp(command, "collect-tsk") == 0) return command_collect(&parsed, 0);
+    if (strcmp(command, "collect-ewf") == 0) return command_collect(&parsed, 1);
     if (strcmp(command, "timeline") == 0) return command_timeline(&parsed, 0);
     if (strcmp(command, "analyze") == 0) return command_timeline(&parsed, 1);
+    if (strcmp(command, "manifest") == 0) return command_case_output(&parsed, 0);
+    if (strcmp(command, "verify") == 0) return command_case_output(&parsed, 1);
+    if (strcmp(command, "report") == 0) return command_report(&parsed);
     af_error("unknown command: %s", command);
     usage(stderr);
     return 2;

@@ -178,12 +178,22 @@ class CerottoTests(unittest.TestCase):
         subprocess.run(["debugfs", "-w", "-R", "rm /deleted.txt", str(image)], check=True, capture_output=True)
         return image
 
+    def make_ewf(self, image):
+        subprocess.run(["ewfacquire", "-u", "-q", "-d", "sha256", "-S", "1048576", "-t", str(self.root / "evidence"), str(image)], check=True, capture_output=True)
+        return self.root / "evidence.E01"
+
     def collect_tsk(self, image, output_name="collected", env=None):
         output = self.root / output_name
         output.mkdir()
         before = hashlib.sha256(image.read_bytes()).hexdigest()
         self.cli("collect-tsk", "--db", self.db_path, "--case", "incident-7", "--image", image, "--output", output, "--host", "agent-vm-1", env=env)
         self.assertEqual(before, hashlib.sha256(image.read_bytes()).hexdigest())
+        return output
+
+    def collect_ewf(self, image, output_name="ewf-collected", expected=0, env=None):
+        output = self.root / output_name
+        output.mkdir()
+        self.cli("collect-ewf", "--db", self.db_path, "--case", "incident-7", "--image", image, "--output", output, "--host", "agent-vm-1", expected=expected, env=env, timeout=60)
         return output
 
     def test_jsonl_parent_rollback_duplicates_and_ranges(self):
@@ -258,7 +268,8 @@ class CerottoTests(unittest.TestCase):
         source = connection.execute("select id,sha256,raw_sha256,command_json from evidence_sources where kind='tsk_fls_body'").fetchone()
         self.assertEqual(source[2], hashlib.sha256((output / "fls.body").read_bytes()).hexdigest())
         commands = json.loads(source[3])
-        self.assertEqual(commands["deleted"][:4], ["fls", "-r", "-d", "-m"])
+        self.assertEqual(commands["allocated"][:4], ["fls", "-i", "raw", "-r"])
+        self.assertEqual(commands["deleted"][:6], ["fls", "-i", "raw", "-r", "-d", "-m"])
         rows = connection.execute("select path,deleted,observed_at from events where source_id=?", (source[0],)).fetchall()
         deleted = next(row for row in rows if row[0] == "/deleted.txt")
         self.assertEqual(deleted[1], 1)
@@ -305,6 +316,89 @@ else:
         self.assertNotIn("CANARY_SECRET_DO_NOT_SEND", serialized)
         self.assertEqual(server.requests[0]["authorization"], "Bearer local-test-key")
         self.assertTrue(all(request["path"] == "/v1/chat/completions" for request in server.requests))
+
+    @unittest.skipUnless(shutil.which("mke2fs") and shutil.which("debugfs") and shutil.which("fls") and shutil.which("ewfacquire") and shutil.which("ewfinfo") and shutil.which("ewfverify"), "EWF tools unavailable")
+    def test_real_ewf_manifest_verification_and_mismatch(self):
+        self.cli("init", "--db", self.db_path)
+        self.ingest_agents()
+        image = self.make_image()
+        ewf = self.make_ewf(image)
+        first_hash = hashlib.sha256(ewf.read_bytes()).hexdigest()
+        output = self.collect_ewf(ewf)
+        self.assertEqual(first_hash, hashlib.sha256(ewf.read_bytes()).hexdigest())
+        connection = self.database()
+        self.assertGreaterEqual(connection.execute("select count(*) from evidence_sources where kind='ewf_segment'").fetchone()[0], 1)
+        self.assertEqual(connection.execute("select count(*) from events where path='/deleted.txt' and deleted=1").fetchone()[0], 1)
+        command = json.loads(connection.execute("select command_json from evidence_sources where kind='tsk_fls_body'").fetchone()[0])
+        self.assertEqual(command["allocated"][:3], ["fls", "-i", "ewf"])
+        self.assertTrue((output / "ewfinfo.txt").is_file())
+        self.assertTrue((output / "ewfverify.txt").is_file())
+        first = self.root / "manifest-first.json"
+        second = self.root / "manifest-second.json"
+        self.cli("manifest", "--db", self.db_path, "--case", "incident-7", "--output", first)
+        self.cli("manifest", "--db", self.db_path, "--case", "incident-7", "--output", second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        manifest = json.loads(first.read_text())
+        self.assertGreaterEqual(len(manifest["sources"]), 5)
+        verified = self.root / "verified.json"
+        self.cli("verify", "--db", self.db_path, "--case", "incident-7", "--output", verified)
+        self.assertTrue(json.loads(verified.read_text())["verified"])
+        second_segment = self.root / "evidence.E02"
+        original = second_segment.read_bytes()
+        second_segment.write_bytes(original + b"corruption")
+        self.cli("verify", "--db", self.db_path, "--case", "incident-7", "--output", verified, expected=1)
+        self.assertIn("mismatch", {check["status"] for check in json.loads(verified.read_text())["checks"]})
+        second_segment.write_bytes(original)
+        second_segment.rename(self.root / "evidence.E02.missing")
+        self.cli("verify", "--db", self.db_path, "--case", "incident-7", "--output", verified, expected=1)
+        self.assertIn("missing", {check["status"] for check in json.loads(verified.read_text())["checks"]})
+
+    def test_failed_ewf_verification_never_runs_tsk(self):
+        self.cli("init", "--db", self.db_path)
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        marker = self.root / "fls-called"
+        (fake_bin / "ewfinfo").write_text("#!/bin/sh\n[ \"$1\" = \"-V\" ] && echo 'ewfinfo test' || echo 'metadata'\n")
+        (fake_bin / "ewfverify").write_text("#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then echo 'ewfverify test'; else echo 'verification failed' >&2; exit 1; fi\n")
+        (fake_bin / "fls").write_text(f"#!/bin/sh\ntouch {marker}\n")
+        for tool in fake_bin.iterdir():
+            tool.chmod(0o755)
+        image = self.root / "evidence.E01"
+        image.write_bytes(b"not valid EWF")
+        output = self.collect_ewf(image, expected=1, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        self.assertFalse(marker.exists())
+        self.assertFalse((output / "fls.body").exists())
+        connection = self.database()
+        self.assertEqual(connection.execute("select count(*) from events").fetchone()[0], 0)
+        self.assertEqual(connection.execute("select status from evidence_sources where kind='ewf_image'").fetchone()[0], "failed")
+        self.assertTrue((output / "ewfverify.txt").is_file())
+
+    def test_report_revalidation_review_and_markdown_escaping(self):
+        self.cli("init", "--db", self.db_path)
+        events = agent_events()
+        events[1]["path"] = "/tmp/<script>alert(1)</script>|payload.sh"
+        self.ingest_agents(events)
+        with MockLLM(["valid"]) as server:
+            analysis, _ = self.analyze(server)
+        common = ("--db", self.db_path, "--case", "incident-7", "--conversation", "conv-7", "--from", "2026-10-27T11:59:00Z", "--to", "2026-10-27T12:05:00Z", "--analysis", analysis)
+        json_report = self.root / "report.json"
+        self.cli("report", *common, "--format", "json", "--output", json_report, "--reviewer", "Incident Reviewer", "--review-status", "reviewed")
+        parsed = json.loads(json_report.read_text())
+        self.assertEqual(parsed["review"]["status"], "reviewed")
+        self.assertEqual(parsed["review"]["reviewer"], "Incident Reviewer")
+        markdown_report = self.root / "report.md"
+        self.cli("report", *common, "--format", "markdown", "--output", markdown_report, "--reviewer", "Incident Reviewer", "--review-status", "approved")
+        rendered = markdown_report.read_text()
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertIn("&#124;", rendered)
+        self.assertIn("Incident Reviewer", rendered)
+        tampered = self.root / "tampered-analysis.json"
+        document = json.loads(analysis.read_text())
+        document["analysis"]["observations"][0]["event_ids"] = ["invented-event"]
+        tampered.write_text(json.dumps(document))
+        self.cli("report", "--db", self.db_path, "--case", "incident-7", "--conversation", "conv-7", "--from", "2026-10-27T11:59:00Z", "--to", "2026-10-27T12:05:00Z", "--analysis", tampered, "--format", "json", expected=1)
+        self.cli("report", *common, "--format", "json", "--review-status", "approved", expected=1)
 
     @unittest.skipUnless(shutil.which("mke2fs") and shutil.which("debugfs") and shutil.which("fls"), "TSK image tools unavailable")
     def test_complete_synthetic_incident(self):
