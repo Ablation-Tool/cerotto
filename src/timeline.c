@@ -17,7 +17,7 @@ static int add_string(cJSON *object, const char *name, const char *value) {
 int af_timeline_build(af_db *db, const af_timeline_query *query, af_buffer *json) {
     static const char sql[] =
         "SELECT id,source_id,observed_at,host_id,source_tool,event_type,conversation_id,"
-        "prompt_id,tool_call_id,process_id,path,deleted,details_json FROM events "
+        "prompt_id,tool_call_id,process_id,parent_process_id,path,deleted,details_json FROM events "
         "WHERE case_id=?1 AND (?2='' OR observed_at>=?2) AND (?3='' OR observed_at<?3) "
         "AND (conversation_id=?4 OR (host_id IN "
         "(SELECT DISTINCT host_id FROM events WHERE case_id=?1 AND conversation_id=?4) "
@@ -78,21 +78,30 @@ int af_timeline_build(af_db *db, const af_timeline_query *query, af_buffer *json
             cJSON_Delete(event);
             goto cleanup;
         }
-        if (add_string(event, "path", column_text(statement, 10))) {
+        if (sqlite3_column_type(statement, 10) == SQLITE_NULL) {
+            if (!cJSON_AddNullToObject(event, "parent_process_id")) {
+                cJSON_Delete(event);
+                goto cleanup;
+            }
+        } else if (!cJSON_AddNumberToObject(event, "parent_process_id", (double)sqlite3_column_int64(statement, 10))) {
             cJSON_Delete(event);
             goto cleanup;
         }
-        if (sqlite3_column_type(statement, 11) == SQLITE_NULL) {
+        if (add_string(event, "path", column_text(statement, 11))) {
+            cJSON_Delete(event);
+            goto cleanup;
+        }
+        if (sqlite3_column_type(statement, 12) == SQLITE_NULL) {
             if (!cJSON_AddNullToObject(event, "deleted")) {
                 cJSON_Delete(event);
                 goto cleanup;
             }
-        } else if (!cJSON_AddBoolToObject(event, "deleted", sqlite3_column_int(statement, 11))) {
+        } else if (!cJSON_AddBoolToObject(event, "deleted", sqlite3_column_int(statement, 12))) {
             cJSON_Delete(event);
             goto cleanup;
         }
         if (!query->metadata_only) {
-            details = cJSON_Parse(column_text(statement, 12));
+            details = cJSON_Parse(column_text(statement, 13));
             if (!details || !cJSON_AddItemToObject(event, "details", details)) {
                 cJSON_Delete(details);
                 cJSON_Delete(event);

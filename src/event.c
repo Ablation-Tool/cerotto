@@ -40,6 +40,7 @@ static int parse_event(cJSON *object, const char *case_id, int64_t source_id,
     event->case_id = case_id;
     event->source_id = source_id;
     event->process_id = -1;
+    event->parent_process_id = -1;
     event->deleted = -1;
     event->details_json = "{}";
     if (!cJSON_IsObject(object)) {
@@ -66,6 +67,16 @@ static int parse_event(cJSON *object, const char *case_id, int64_t source_id,
             return -1;
         }
         event->process_id = (int64_t)process->valuedouble;
+    }
+    process = cJSON_GetObjectItemCaseSensitive(object, "parent_process_id");
+    if (process) {
+        if (!cJSON_IsNumber(process) || !isfinite(process->valuedouble) ||
+            process->valuedouble < 0 || process->valuedouble > 9007199254740991.0 ||
+            floor(process->valuedouble) != process->valuedouble) {
+            af_error("event field parent_process_id must be a nonnegative safe integer");
+            return -1;
+        }
+        event->parent_process_id = (int64_t)process->valuedouble;
     }
     deleted = cJSON_GetObjectItemCaseSensitive(object, "deleted");
     if (deleted) {

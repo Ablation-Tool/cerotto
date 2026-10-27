@@ -136,6 +136,7 @@ static int insert_body_event(af_db *db, const char *case_id, int64_t source_id,
     event.prompt_id = "";
     event.tool_call_id = "";
     event.process_id = -1;
+    event.parent_process_id = -1;
     event.path = fields[1];
     event.deleted = deleted_pass;
     event.details_json = details;
