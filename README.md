@@ -1,7 +1,6 @@
 
 **CEROTTO investigates AI agents.**
 
-It connects prompts and tool calls to processes, files, network activity, and disk evidence—then produces a reviewable timeline and an optional evidence-cited analysis.
 
 
 ---
