@@ -1,57 +1,170 @@
-# CEROTTO
+<p align="center">
+  <img src="assets/branding/cerotto-wordmark.svg" width="640" alt="CEROTTO">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Ablation-Tool/cerotto/actions/workflows/ci.yml"><img src="https://github.com/Ablation-Tool/cerotto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/version-0.2.0-grey" alt="Version 0.2.0">
+  <img src="https://img.shields.io/badge/language-C11-grey" alt="C11">
+  <img src="https://img.shields.io/badge/platform-Linux-grey" alt="Linux">
+</p>
 
 **CEROTTO helps investigators trace what an AI agent did on a computer.**
 
-It connects agent activity—such as conversations, tool calls, and process IDs—with host evidence such as audit events and filesystem timelines. A C11/POSIX core collects and correlates the evidence; an optional LLM explains a bounded timeline with mandatory event-ID citations.
+It connects prompts and tool calls to processes, files, network activity, and disk evidence—then produces a reviewable timeline and an optional evidence-cited analysis.
 
-Deterministic tools remain separate from the analytical layer. The model has no host credentials, shell, or tool-execution path, and its output is never executed. Citations constrain unsupported event references, but do not guarantee correct interpretation. Reports are investigative assistance, not forensic findings or proof of causation.
+---
 
-## Status
+## Who is it for?
 
-Version 0.2.0 implements:
+CEROTTO is for **incident responders, security engineers, and forensic analysts** who run or investigate AI agents that can access files, execute tools, or make network connections.
 
-- Transactional agent-event JSONL ingestion.
-- Linux audit-log ingestion with process/parent-PID, file, and network attribution.
-- Sleuth Kit allocated and deleted-file collection with preserved provenance.
-- SQLite conversation, host, process, and time-window correlation.
-- Metadata-only OpenAI-compatible analysis with response-schema and citation validation.
-- A versioned schema with v1-to-v2 migration, integration tests, and sanitizer-capable builds.
+Use it when you need to answer questions such as:
 
-CEROTTO does **not** configure auditd, provide live containment, or give the model host access. VM snapshots, AFF/EWF acquisition, carving, Chkrootkit, Volatility, natural-language queries, fleet-wide analysis, and incident similarity graphs remain future work.
+- What happened on the host after this suspicious conversation?
+- Which process ran after this tool call, and what was its parent process?
+- Did the agent access a sensitive file, create or delete a script, or open a network connection?
+- What does the available evidence actually establish—and what remains uncertain?
 
-## Build and test
+## What problem does it solve?
 
-Requirements: a C11 compiler, Make, Python 3, POSIX, `fls`, and `curl`. The real-image tests also use `mke2fs` and `debugfs`. SQLite and cJSON are pinned in `vendor/`; no C development packages are needed.
+Agent investigations produce scattered evidence:
 
-```sh
+| Evidence you have | What it tells you |
+|---|---|
+| Prompt and tool-call logs | What the agent was asked to do and which tools it invoked |
+| Linux audit logs | Which processes ran and which file/network operations occurred |
+| Disk images | Which files existed, changed, or were deleted |
+
+Manually connecting these records is slow and error-prone. **CEROTTO puts them into one case and one ordered timeline.** An optional LLM can summarize that timeline with citations to the exact events it used.
+
+CEROTTO helps investigate causation; it does not claim that timing alone proves it.
+
+## What does CEROTTO do?
+
+| Input | CEROTTO processing | Output |
+|---|---|---|
+| Agent-event JSONL | Validates records and preserves source hashes | One SQLite evidence case |
+| Captured Linux audit logs | Correlates audit records into process, file, and network events | Ordered, filtered JSON timelines |
+| Raw disk images | Runs Sleuth Kit allocated/deleted-file passes and preserves provenance | Evidence manifests and hashes |
+| Bounded timeline metadata | Sends only the selected metadata to an optional LLM | Observations, hypotheses, limitations, and event citations |
+
+### The safety model
+
+Deterministic code collects evidence and runs the queries. **The LLM has no shell, host credentials, forensic-tool access, or execution path.** Its output is never executed.
+
+Citations prevent invented event references. They do not guarantee that an interpretation is correct, so a human still reviews the evidence.
+
+## A typical investigation
+
+```bash
+make
+
+CEROTTO=build/cerotto
+
+# Create a case and import agent and host telemetry.
+$CEROTTO init --db case.db
+$CEROTTO ingest --db case.db --case incident-7 --input agent-events.jsonl
+$CEROTTO ingest-audit --db case.db --case incident-7 \
+  --input audit.log --host agent-vm-1
+
+# Add filesystem evidence from a raw disk image.
+mkdir -p collected/incident-7
+$CEROTTO collect-tsk --db case.db --case incident-7 \
+  --image agent-disk.img --output collected/incident-7 --host agent-vm-1
+
+# Review what happened around the conversation.
+$CEROTTO timeline --db case.db --case incident-7 --conversation conv-7 \
+  --from 2026-10-27T11:59:00Z --to 2026-10-27T12:05:00Z
+```
+
+The result links conversation-associated events with activity on the relevant host during the selected half-open time window.
+
+---
+
+## Capabilities
+
+<details>
+<summary><strong>Collection & Attribution</strong></summary>
+
+| Capability | What it does |
+|---|---|
+| **Agent events** | Transactional JSONL ingestion with conversation, prompt, tool-call, process, parent-process, path, and timestamp fields. |
+| **Process attribution** | Combines `SYSCALL` and `EXECVE` audit records into process events with PID, PPID, executable, arguments, and result. |
+| **File and network events** | Correlates supported `PATH` and `SOCKADDR` records for open/create/unlink and connect operations. |
+| **Audit decoding** | Handles interleaved records, quoted/hex strings, `node=` host identity, and normalized fractional timestamps. |
+| **Filesystem timelines** | Runs separate allocated and deleted-file `fls` passes without mounting or modifying the image. |
+| **Provenance** | Preserves source/output hashes, exact commands, tool versions, acquisition times, and import status. |
+
+Failed audit operations are recorded as attempts, not successful actions. Malformed input or duplicate stable event IDs roll back an import.
+
+</details>
+
+<details>
+<summary><strong>Analysis & Review</strong></summary>
+
+| Capability | What it does |
+|---|---|
+| **Deterministic timelines** | SQL selects conversation-linked and same-host events by host and time range—not the LLM. |
+| **Process ancestry** | Includes PID and parent PID in timeline output. |
+| **Bounded LLM analysis** | Sends at most 500 events and excludes free-form event details. |
+| **Citation validation** | Rejects invented event IDs and malformed response structures. |
+| **Transport safeguards** | Uses timeouts, response limits, owner-only temporary payloads, and no API key in process arguments. |
+
+Paths and identifiers remain untrusted evidence and may contain hostile text. Review material claims against the original records and apply your organization's confidentiality requirements before using an external model.
+
+</details>
+
+<details>
+<summary><strong>What CEROTTO does not do</strong></summary>
+
+- It does not prevent prompt injection or replace agent sandboxing and access controls.
+- It does not configure auditd or provide live containment.
+- It does not give the LLM direct host access or execute model suggestions.
+- It does not prove that a prompt caused a host event merely because one preceded the other.
+- It does not currently provide natural-language queries, fleet-wide analysis, incident-similarity graphs, AFF/EWF acquisition, carving, Chkrootkit, or Volatility integration.
+
+</details>
+
+---
+
+## Setup & Reference
+
+<details>
+<summary><strong>Install and verify</strong></summary>
+
+Requirements: a C11 compiler, Make, Python 3, POSIX, `fls`, and `curl`. Real-image tests also use `mke2fs` and `debugfs`. SQLite and cJSON are pinned in `vendor/`; no C development packages are required.
+
+```bash
 make
 make check
 make sanitize
 make check BUILD_DIR=build/sanitize
 ```
 
-The executable is `build/cerotto` (or `build/sanitize/cerotto`). Tests exercise the actual CLI with generated evidence and a local mock LLM; they do not contact an external provider. GitHub Actions runs both normal and AddressSanitizer/UndefinedBehaviorSanitizer suites.
+The executable is `build/cerotto`. Tests use generated evidence and a local mock LLM; no external provider is contacted. GitHub Actions runs normal and AddressSanitizer/UndefinedBehaviorSanitizer suites.
 
-## Agent event input
+</details>
 
-`ingest` accepts one JSON object per line. Required fields are `id`, `observed_at`, `host_id`, `source_tool`, and `event_type`. Optional fields are `conversation_id`, `prompt_id`, `tool_call_id`, `process_id`, `parent_process_id`, `path`, `deleted`, and `details` (an object). Timestamps must be UTC with at most six fractional-second digits.
+<details>
+<summary><strong>Agent JSONL format</strong></summary>
+
+Required fields: `id`, `observed_at`, `host_id`, `source_tool`, and `event_type`.
+
+Optional fields: `conversation_id`, `prompt_id`, `tool_call_id`, `process_id`, `parent_process_id`, `path`, `deleted`, and `details` (an object). Timestamps must be UTC with at most six fractional-second digits.
 
 ```json
 {"id":"evt-001","observed_at":"2026-10-27T12:00:00Z","host_id":"agent-vm-1","source_tool":"agent_gateway","event_type":"tool_call","conversation_id":"conv-7","prompt_id":"prompt-9","tool_call_id":"call-3","process_id":420,"parent_process_id":100,"path":"/tmp/job.sh"}
 ```
 
-## Audit-log attribution
+</details>
 
-`ingest-audit` parses captured Linux audit logs and correlates records sharing an audit event ID, including interleaved records. It supports:
+<details>
+<summary><strong>Audit configuration</strong></summary>
 
-- `SYSCALL` + `EXECVE` for execve/execveat process events and arguments.
-- `SYSCALL` + `PATH` for supported open/create/unlink file activity.
-- `SYSCALL` + `SOCKADDR` for supported connect events.
-- Quoted and audit hex-encoded strings, `node=` host selection, and microsecond-normalized timestamps.
+CEROTTO ingests captured logs; an administrator chooses the audit policy. Coverage targets common x86-64, x86, and AArch64 execve/execveat, open/create/unlink, and connect syscall numbers—not every Linux ABI or record type.
 
-Failed operations are recorded as attempts rather than successful actions. Audit events do not receive conversation or tool-call IDs unless a future trusted mapping supplies them; CEROTTO correlates them by host, process, and time instead. Coverage currently targets common x86-64, x86, and AArch64 syscall numbers, not every Linux ABI or audit record type.
-
-An administrator must choose and configure audit rules appropriate for the host. For example, a controlled investigation might use rules such as:
+Example rules for a controlled investigation:
 
 ```text
 -a always,exit -F arch=b64 -S execve -S execveat -k cerotto_exec
@@ -60,52 +173,30 @@ An administrator must choose and configure audit rules appropriate for the host.
 -w /opt/agent/tmp -p wa -k cerotto_files
 ```
 
-These are examples, not automatically installed policy. Broad process, file, and network auditing can create substantial log volume and overhead. Test rules in a disposable environment, protect audit logs, and preserve their original timestamps and host identity.
+These examples are not installed automatically. Broad auditing can create substantial overhead and log volume. Test rules in a disposable environment and protect the resulting logs.
 
-## Workflow
+</details>
 
-```sh
-CEROTTO=build/cerotto
+<details>
+<summary><strong>Optional LLM analysis</strong></summary>
 
-$CEROTTO init --db case.db
-$CEROTTO ingest --db case.db --case incident-7 --input agent-events.jsonl
-$CEROTTO ingest-audit --db case.db --case incident-7 \
-  --input audit.log --host agent-vm-1
-
-mkdir -p collected/incident-7
-$CEROTTO collect-tsk --db case.db --case incident-7 \
-  --image agent-disk.img --output collected/incident-7 --host agent-vm-1
-
-$CEROTTO timeline --db case.db --case incident-7 --conversation conv-7 \
-  --from 2026-10-27T11:59:00Z --to 2026-10-27T12:05:00Z
-```
-
-Both ingestion paths record input hashes, source metadata, acquisition time, and completed/failed status. Records are inserted transactionally; malformed input or duplicate stable event IDs roll back the import.
-
-`collect-tsk` requires a regular image file and an existing output directory. It never mounts the image. Separate allocated and deleted-file `fls` passes are preserved in `fls.body`, together with both exact commands, image/raw-output hashes, tool version, acquisition time, and event provenance. Existing evidence is not overwritten.
-
-Timeline queries include events directly linked to the conversation plus events from hosts associated with that conversation. Time ranges are half-open (`from` inclusive, `to` exclusive). `--host` narrows correlated host activity. Details are omitted unless `--include-details` is supplied. Parent PIDs expose process ancestry, but timeline timing alone still does not prove causation.
-
-## LLM analysis
-
-Configure an OpenAI-compatible endpoint:
-
-```sh
+```bash
 export CEROTTO_BASE_URL=https://provider.example/v1
 export CEROTTO_MODEL=model-name
 export CEROTTO_API_KEY=key-if-required
 
-$CEROTTO analyze --db case.db --case incident-7 --conversation conv-7
+build/cerotto analyze --db case.db --case incident-7 --conversation conv-7
 ```
 
-The client appends `/chat/completions` to the base URL. Deterministic SQL—not the model—selects the evidence. Analysis is limited to 500 events and excludes free-form event details. Paths and identifiers remain untrusted and may contain hostile text.
+CEROTTO appends `/chat/completions` to the base URL. Use a local mock endpoint during development rather than transmitting sensitive evidence.
 
-Responses must follow the requested JSON schema and cite only supplied event IDs; invented citations are rejected. Requests have connection and total timeouts, responses are size-limited, and API keys are passed to `curl` through standard input rather than process arguments. Temporary request payloads are owner-only and removed after use.
+</details>
 
-Use a local mock endpoint for development rather than sending sensitive evidence to an external provider. Review material claims against the underlying evidence, and apply your organization's confidentiality and data-governance requirements before using an external model.
+<details>
+<summary><strong>Responsible use and evidence handling</strong></summary>
 
-## Trust and handling
+Use CEROTTO only for authorized investigations. Preserve original evidence separately, analyze verified copies, use synchronized UTC clocks, and run collectors with the least privilege available in an isolated environment.
 
-Run collectors with the least privilege available in an isolated analysis environment. Preserve original evidence separately, work from verified copies, use synchronized UTC clocks, and do not ingest untrusted collector output into a privileged shell. The database and generated reports can contain sensitive investigation metadata and should be protected accordingly.
+Databases, timelines, and reports can contain sensitive investigation metadata. Protect them accordingly. Vendored dependency versions, source URLs, hashes, and licenses are documented in `vendor/README.md`.
 
-Vendored dependency versions, source URLs, hashes, and licenses are documented in `vendor/README.md`.
+</details>
