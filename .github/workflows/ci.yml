@@ -12,8 +12,14 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      ABLATION_REPO: ${{ github.workspace }}/.ablation-source
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Ablation-Tool/ablation
+          path: .ablation-source
       - name: Install build and forensic tools
         run: |
           sudo apt-get update
