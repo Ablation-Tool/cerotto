@@ -1,10 +1,4 @@
 
-CEROTTO is a digital forensics and incident response (DFIR) tool.
-
-
----
-
-
 CEROTTO is a Digital Forensics and Incident Response tool, built for a modern problem: investigating AI agents.
 
 
