@@ -25,7 +25,7 @@ Use it when you need to answer questions such as:
 - What happened on the host after this suspicious conversation?
 - Which process ran after this tool call, and what was its parent process?
 - Did the agent access a sensitive file, create or delete a script, or open a network connection?
-- What does the available evidence actually establish—and what remains uncertain?
+- What does the available evidence actually establish and what remains uncertain?
 
 ## What problem does it solve?
 
