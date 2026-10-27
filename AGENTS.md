@@ -2,7 +2,7 @@
 
 ## Repository structure
 
-Follow the Ablation-Tool repository standard: concise positioning, verified capability tables, compact sections, and collapsible reference material. Link capability claims to implementation and tests. Do not claim unimplemented features or unverified compliance.
+Follow the Ablation-Tool repository standard: concise positioning, verified capability tables, compact sections, and collapsible reference material. Link capability claims to implementation and tests. Do not claim unimplemented features or unverified compliance. Do not add banners, branding images, or shields.
 
 ## Documentation
 
