@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import hashlib
 import http.server
 import json
@@ -195,6 +196,48 @@ class CerottoTests(unittest.TestCase):
         output.mkdir()
         self.cli("collect-ewf", "--db", self.db_path, "--case", "incident-7", "--image", image, "--output", output, "--host", "agent-vm-1", expected=expected, env=env, timeout=60)
         return output
+
+    def make_carve_image(self):
+        png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=')
+        gif = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+        image = self.root / "carve-source.img"
+        image.write_bytes(b'prefix' + png + b'middle' + gif + b'suffix')
+        return image
+
+    def collect_carve(self, image, output_name="recovered", carver="foremost", expected=0, env=None):
+        output = self.root / output_name
+        before = hashlib.sha256(image.read_bytes()).hexdigest()
+        self.cli("carve", "--db", self.db_path, "--case", "incident-7", "--image", image, "--output", output, "--host", "agent-vm-1", "--carver", carver, expected=expected, env=env, timeout=60)
+        self.assertEqual(before, hashlib.sha256(image.read_bytes()).hexdigest())
+        return output
+
+    def fake_scalpel(self):
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        fake = fake_bin / "scalpel"
+        fake.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+if '-V' in sys.argv:
+    print('scalpel test')
+    raise SystemExit(0)
+out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+out.mkdir()
+(out / 'audit.txt').write_text('controlled audit')
+(out.parent / f'{out.name}-args.json').write_text(json.dumps(sys.argv[1:]))
+mode = os.environ.get('CARVER_MODE', 'normal')
+if mode == 'normal':
+    (out / 'nested').mkdir()
+    (out / 'nested/artifact.bin').write_bytes(b'ARTIFACT_CONTENT_MUST_NOT_LEAK\\x00\\x01\\x02')
+elif mode == 'symlink':
+    (out / 'link').symlink_to(sys.argv[-1])
+elif mode == 'many':
+    for index in range(10001):
+        (out / f'{index}.bin').write_bytes(b'')
+elif mode == 'failed':
+    raise SystemExit(1)
+""")
+        fake.chmod(0o755)
+        return fake_bin
 
     def test_jsonl_parent_rollback_duplicates_and_ranges(self):
         self.cli("init", "--db", self.db_path)
@@ -399,6 +442,90 @@ else:
         tampered.write_text(json.dumps(document))
         self.cli("report", "--db", self.db_path, "--case", "incident-7", "--conversation", "conv-7", "--from", "2026-10-27T11:59:00Z", "--to", "2026-10-27T12:05:00Z", "--analysis", tampered, "--format", "json", expected=1)
         self.cli("report", *common, "--format", "json", "--review-status", "approved", expected=1)
+
+    @unittest.skipUnless(shutil.which("foremost"), "Foremost unavailable")
+    def test_foremost_carve_manifest_and_artifact_inspection(self):
+        self.cli("init", "--db", self.db_path)
+        self.ingest_agents()
+        image = self.make_carve_image()
+        output = self.collect_carve(image)
+        connection = self.database()
+        artifacts = connection.execute("select id,stored_path,raw_sha256 from evidence_sources where kind='carved_artifact'").fetchall()
+        self.assertEqual(len(artifacts), 2)
+        self.assertEqual(connection.execute("select count(*) from events where event_type='evidence_recovered'").fetchone()[0], 2)
+        verified = self.root / "verify.json"
+        self.cli("verify", "--db", self.db_path, "--case", "incident-7", "--output", verified)
+        self.assertTrue(json.loads(verified.read_text())["verified"])
+        artifact_id, path, expected_hash = artifacts[0]
+        shown = self.root / "artifact.json"
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", artifact_id, "--format", "json", "--max-bytes", 16, "--output", shown)
+        document = json.loads(shown.read_text())
+        content = Path(path).read_bytes()
+        self.assertEqual(base64.b64decode(document["data"]), content[:16])
+        self.assertEqual(document["sha256"], expected_hash)
+        self.assertEqual(document["size_bytes"], len(content))
+        self.assertTrue(document["truncated"])
+        hexadecimal = self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", artifact_id, "--max-bytes", 16).stdout
+        self.assertIn("# truncated=true", hexadecimal)
+        self.assertIn("00000000", hexadecimal)
+        run_id = connection.execute("select id from evidence_sources where kind='carver_run'").fetchone()[0]
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", run_id, expected=1)
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "other-case", "--source-id", artifact_id, expected=1)
+        Path(path).write_bytes(content + b"tampered")
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", artifact_id, expected=1)
+        self.cli("verify", "--db", self.db_path, "--case", "incident-7", "--output", verified, expected=1)
+        Path(path).write_bytes(content)
+        Path(path).rename(str(path) + ".missing")
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", artifact_id, expected=1)
+
+    def test_scalpel_catalog_existing_output_and_llm_boundary(self):
+        self.cli("init", "--db", self.db_path)
+        self.ingest_agents()
+        image = self.make_carve_image()
+        fake_bin = self.fake_scalpel()
+        env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        output = self.collect_carve(image, carver="scalpel", env=env)
+        arguments = json.loads((self.root / f"{output.name}-args.json").read_text())
+        self.assertEqual(arguments[:3], ["-b", "-o", str(output)])
+        self.assertEqual(arguments[-1], str(image))
+        connection = self.database()
+        artifact_id, path = connection.execute("select id,stored_path from evidence_sources where kind='carved_artifact'").fetchone()
+        shown = self.root / "artifact.json"
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", artifact_id, "--format", "json", "--max-bytes", 8, "--output", shown)
+        document = json.loads(shown.read_text())
+        self.assertEqual(base64.b64decode(document["data"]), b"ARTIFACT")
+        self.assertTrue(document["truncated"])
+        with MockLLM(["valid"]) as server:
+            self.analyze(server)
+        self.assertNotIn("ARTIFACT_CONTENT_MUST_NOT_LEAK", json.dumps(server.requests[0]["payload"]))
+        self.collect_carve(image, carver="scalpel", expected=1, env=env)
+        self.assertEqual(connection.execute("select count(*) from evidence_sources where kind='carved_artifact'").fetchone()[0], 1)
+        self.cli("artifact", "show", "--db", self.db_path, "--case", "incident-7", "--source-id", artifact_id, "--max-bytes", 1048577, expected=2)
+
+    def test_carver_symlink_and_catalog_limit_rollback(self):
+        self.cli("init", "--db", self.db_path)
+        image = self.make_carve_image()
+        fake_bin = self.fake_scalpel()
+        env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "CARVER_MODE": "symlink"}
+        self.collect_carve(image, output_name="symlink-output", carver="scalpel", expected=1, env=env)
+        connection = self.database()
+        self.assertEqual(connection.execute("select count(*) from evidence_sources").fetchone()[0], 0)
+        env["CARVER_MODE"] = "many"
+        self.collect_carve(image, output_name="many-output", carver="scalpel", expected=1, env=env)
+        self.assertEqual(connection.execute("select count(*) from evidence_sources").fetchone()[0], 0)
+
+    def test_carver_zero_file_and_failed_status(self):
+        self.cli("init", "--db", self.db_path)
+        image = self.make_carve_image()
+        fake_bin = self.fake_scalpel()
+        env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "CARVER_MODE": "zero"}
+        self.collect_carve(image, output_name="zero-output", carver="scalpel", env=env)
+        env["CARVER_MODE"] = "failed"
+        self.collect_carve(image, output_name="failed-output", carver="scalpel", expected=1, env=env)
+        connection = self.database()
+        statuses = connection.execute("select status,count(*) from evidence_sources where kind='carver_run' group by status").fetchall()
+        self.assertEqual(dict(statuses), {"completed": 1, "failed": 1})
+        self.assertEqual(connection.execute("select count(*) from evidence_sources where kind='carved_artifact'").fetchone()[0], 0)
 
     @unittest.skipUnless(shutil.which("mke2fs") and shutil.which("debugfs") and shutil.which("fls"), "TSK image tools unavailable")
     def test_complete_synthetic_incident(self):

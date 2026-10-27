@@ -1,5 +1,7 @@
 #include "analyze.h"
+#include "artifact.h"
 #include "audit.h"
+#include "carve.h"
 #include "collect.h"
 #include "db.h"
 #include "event.h"
@@ -13,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VERSION "0.3.0"
+#define VERSION "0.4.0"
 
 typedef struct {
     const char *db;
@@ -30,8 +32,12 @@ typedef struct {
     const char *reviewer;
     const char *review_status;
     const char *base;
+    const char *carver;
+    int64_t source_id;
+    size_t max_bytes;
     size_t limit;
     int include_details;
+    int format_set;
 } options;
 
 static void usage(FILE *output) {
@@ -43,11 +49,13 @@ static void usage(FILE *output) {
         "  cerotto ingest-audit --db DB --case CASE --input AUDIT.log --host HOST\n"
         "  cerotto collect-tsk --db DB --case CASE --image IMAGE --output DIR --host HOST\n"
         "  cerotto collect-ewf --db DB --case CASE --image evidence.E01 --output DIR --host HOST\n"
+        "  cerotto carve --db DB --case CASE --image IMAGE --output NEW_DIR --host HOST [--carver foremost|scalpel]\n"
         "  cerotto timeline --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--include-details] [--output FILE]\n"
         "  cerotto analyze --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--output FILE]\n"
         "  cerotto manifest --db DB --case CASE [--output FILE]\n"
         "  cerotto verify --db DB --case CASE [--base DIR] [--output FILE]\n"
-        "  cerotto report --db DB --case CASE --conversation ID [--analysis FILE] [--format json|markdown] [--reviewer NAME --review-status STATUS] [--output FILE]\n\n"
+        "  cerotto report --db DB --case CASE --conversation ID [--analysis FILE] [--format json|markdown] [--reviewer NAME --review-status STATUS] [--output FILE]\n"
+        "  cerotto artifact show --db DB --case CASE --source-id ID [--format hex|json] [--max-bytes N] [--base DIR] [--output FILE]\n\n"
         "Timestamps must be ISO-8601 UTC, for example 2026-10-27T12:00:00Z.\n"
         "Analysis requires CEROTTO_BASE_URL and CEROTTO_MODEL.\n"
         "The base URL is the OpenAI-compatible prefix before /chat/completions.\n",
@@ -77,7 +85,9 @@ static int parse_options(int argc, char **argv, options *parsed) {
     int index;
     memset(parsed, 0, sizeof(*parsed));
     parsed->limit = 10000;
+    parsed->max_bytes = 8192;
     parsed->format = "markdown";
+    parsed->carver = "foremost";
     parsed->review_status = "unreviewed";
     for (index = 0; index < argc; ++index) {
         const char *name = argv[index];
@@ -101,10 +111,34 @@ static int parse_options(int argc, char **argv, options *parsed) {
         else if (strcmp(name, "--from") == 0) parsed->from = value;
         else if (strcmp(name, "--to") == 0) parsed->to = value;
         else if (strcmp(name, "--analysis") == 0) parsed->analysis = value;
-        else if (strcmp(name, "--format") == 0) parsed->format = value;
+        else if (strcmp(name, "--format") == 0) {
+            parsed->format = value;
+            parsed->format_set = 1;
+        }
         else if (strcmp(name, "--reviewer") == 0) parsed->reviewer = value;
         else if (strcmp(name, "--review-status") == 0) parsed->review_status = value;
         else if (strcmp(name, "--base") == 0) parsed->base = value;
+        else if (strcmp(name, "--carver") == 0) parsed->carver = value;
+        else if (strcmp(name, "--source-id") == 0) {
+            char *end;
+            errno = 0;
+            long long id = strtoll(value, &end, 10);
+            if (errno || *end || end == value || id <= 0) {
+                af_error("source-id must be a positive integer");
+                return -1;
+            }
+            parsed->source_id = (int64_t)id;
+        }
+        else if (strcmp(name, "--max-bytes") == 0) {
+            char *end;
+            errno = 0;
+            unsigned long amount = strtoul(value, &end, 10);
+            if (errno || *end || end == value || amount == 0 || amount > 1048576) {
+                af_error("max-bytes must be between 1 and 1048576");
+                return -1;
+            }
+            parsed->max_bytes = (size_t)amount;
+        }
         else if (strcmp(name, "--limit") == 0) {
             char *end;
             unsigned long limit;
@@ -362,9 +396,60 @@ static int command_report(const options *parsed) {
     return result == 0 ? 0 : 1;
 }
 
+static int command_carve(const options *parsed) {
+    af_db db;
+    size_t count = 0;
+    int result;
+    if (!parsed->case_id || !parsed->image || !parsed->output || !parsed->host) {
+        af_error("carve requires --case, --image, --output, and --host");
+        return 1;
+    }
+    if (open_database(parsed, &db) != 0) {
+        return 1;
+    }
+    result = af_carve(&db, parsed->case_id, parsed->image, parsed->output,
+                      parsed->host, parsed->carver, &count);
+    af_db_close(&db);
+    if (result == 0) {
+        printf("{\"artifacts_recovered\":%zu}\n", count);
+        return 0;
+    }
+    return 1;
+}
+
+static int command_artifact(const options *parsed) {
+    af_db db;
+    const char *format = parsed->format_set ? parsed->format : "hex";
+    FILE *output = stdout;
+    int result;
+    if (!parsed->case_id || parsed->source_id <= 0) {
+        af_error("artifact show requires --case and --source-id");
+        return 1;
+    }
+    if (open_database(parsed, &db) != 0) {
+        return 1;
+    }
+    if (parsed->output) {
+        output = fopen(parsed->output, "wb");
+        if (!output) {
+            af_error("cannot open output %s: %s", parsed->output, strerror(errno));
+            af_db_close(&db);
+            return 1;
+        }
+    }
+    result = af_artifact_show(&db, parsed->case_id, parsed->source_id, format,
+                              parsed->max_bytes, parsed->base, output);
+    if (output != stdout && fclose(output) != 0) {
+        result = -1;
+    }
+    af_db_close(&db);
+    return result == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     options parsed;
     const char *command;
+    int option_index = 2;
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "version") == 0)) {
         puts(VERSION);
         return 0;
@@ -374,7 +459,15 @@ int main(int argc, char **argv) {
         return argc < 2 ? 2 : 0;
     }
     command = argv[1];
-    if (parse_options(argc - 2, argv + 2, &parsed) != 0) {
+    if (!strcmp(command, "artifact")) {
+        if (argc < 4 || strcmp(argv[2], "show")) {
+            af_error("expected artifact show");
+            return 2;
+        }
+        command = "artifact-show";
+        option_index = 3;
+    }
+    if (parse_options(argc - option_index, argv + option_index, &parsed) != 0) {
         return 2;
     }
     if (strcmp(command, "init") == 0) {
@@ -390,11 +483,13 @@ int main(int argc, char **argv) {
     if (strcmp(command, "ingest-audit") == 0) return command_ingest(&parsed, 1);
     if (strcmp(command, "collect-tsk") == 0) return command_collect(&parsed, 0);
     if (strcmp(command, "collect-ewf") == 0) return command_collect(&parsed, 1);
+    if (strcmp(command, "carve") == 0) return command_carve(&parsed);
     if (strcmp(command, "timeline") == 0) return command_timeline(&parsed, 0);
     if (strcmp(command, "analyze") == 0) return command_timeline(&parsed, 1);
     if (strcmp(command, "manifest") == 0) return command_case_output(&parsed, 0);
     if (strcmp(command, "verify") == 0) return command_case_output(&parsed, 1);
     if (strcmp(command, "report") == 0) return command_report(&parsed);
+    if (strcmp(command, "artifact-show") == 0) return command_artifact(&parsed);
     af_error("unknown command: %s", command);
     usage(stderr);
     return 2;
