@@ -172,9 +172,11 @@ static char *tool_version(void) {
     return version;
 }
 
-static cJSON *command_array(const char *image_path, int deleted) {
+static cJSON *command_array(const char *image_path, int deleted, int ewf) {
     cJSON *array = cJSON_CreateArray();
     if (!array || !cJSON_AddItemToArray(array, cJSON_CreateString("fls")) ||
+        !cJSON_AddItemToArray(array, cJSON_CreateString("-i")) ||
+        !cJSON_AddItemToArray(array, cJSON_CreateString(ewf ? "ewf" : "raw")) ||
         !cJSON_AddItemToArray(array, cJSON_CreateString("-r")) ||
         (deleted && !cJSON_AddItemToArray(array, cJSON_CreateString("-d"))) ||
         !cJSON_AddItemToArray(array, cJSON_CreateString("-m")) ||
@@ -186,10 +188,10 @@ static cJSON *command_array(const char *image_path, int deleted) {
     return array;
 }
 
-static char *command_json(const char *image_path) {
+static char *command_json(const char *image_path, int ewf) {
     cJSON *root = cJSON_CreateObject();
-    cJSON *allocated = command_array(image_path, 0);
-    cJSON *deleted = command_array(image_path, 1);
+    cJSON *allocated = command_array(image_path, 0, ewf);
+    cJSON *deleted = command_array(image_path, 1, ewf);
     char *output = NULL;
     if (!root || !allocated || !deleted ||
         !cJSON_AddItemToObject(root, "allocated", allocated)) {
@@ -210,7 +212,7 @@ static char *command_json(const char *image_path) {
 }
 
 int af_collect_tsk_impl(af_db *db, const char *case_id, const char *image_path,
-                        const char *output_dir, const char *host_id, size_t *count) {
+                        const char *output_dir, const char *host_id, int ewf, size_t *count) {
     struct stat status;
     char image_hash[65];
     char raw_hash[65];
@@ -245,15 +247,16 @@ int af_collect_tsk_impl(af_db *db, const char *case_id, const char *image_path,
         goto cleanup;
     }
     version = tool_version();
-    command = command_json(image_path);
+    command = command_json(image_path, ewf);
     raw_path = af_path_join(output_dir, "fls.body");
     if (!version || !command || !raw_path) {
         af_error("cannot prepare TSK collection");
         goto cleanup;
     }
     {
-        char *allocated_argv[] = {"fls", "-r", "-m", "/", (char *)image_path, NULL};
-        char *deleted_argv[] = {"fls", "-r", "-d", "-m", "/", (char *)image_path, NULL};
+        char *format = ewf ? "ewf" : "raw";
+        char *allocated_argv[] = {"fls", "-i", format, "-r", "-m", "/", (char *)image_path, NULL};
+        char *deleted_argv[] = {"fls", "-i", format, "-r", "-d", "-m", "/", (char *)image_path, NULL};
         if (af_process_run(allocated_argv, NULL, 0, TSK_OUTPUT_LIMIT, &process) != 0 ||
             af_process_run(deleted_argv, NULL, 0, TSK_OUTPUT_LIMIT, &deleted_process) != 0) {
             goto cleanup;
