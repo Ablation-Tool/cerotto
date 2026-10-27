@@ -1,4 +1,5 @@
 #include "analyze.h"
+#include "audit.h"
 #include "collect.h"
 #include "db.h"
 #include "event.h"
@@ -10,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 
 typedef struct {
     const char *db;
@@ -32,6 +33,7 @@ static void usage(FILE *output) {
         "Usage:\n"
         "  cerotto init --db DB\n"
         "  cerotto ingest --db DB --case CASE --input EVENTS.jsonl\n"
+        "  cerotto ingest-audit --db DB --case CASE --input AUDIT.log --host HOST\n"
         "  cerotto collect-tsk --db DB --case CASE --image IMAGE --output DIR --host HOST\n"
         "  cerotto timeline --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--include-details] [--output FILE]\n"
         "  cerotto analyze --db DB --case CASE --conversation ID [--host HOST] [--from UTC] [--to UTC] [--limit N] [--output FILE]\n\n"
@@ -135,7 +137,7 @@ static int set_source_status(af_db *db, int64_t source_id, const char *status) {
     return result;
 }
 
-static int command_ingest(const options *parsed) {
+static int command_ingest(const options *parsed, int audit) {
     af_db db;
     af_source source;
     char acquired_at[AF_TIMESTAMP_SIZE];
@@ -144,8 +146,10 @@ static int command_ingest(const options *parsed) {
     int64_t source_id = 0;
     size_t count = 0;
     int result = -1;
-    if (!parsed->case_id || !parsed->input) {
-        af_error("ingest requires --case and --input");
+    int ingest_result;
+    if (!parsed->case_id || !parsed->input || (audit && !parsed->host)) {
+        af_error("%s requires --case and --input%s", audit ? "ingest-audit" : "ingest",
+                 audit ? " and --host" : "");
         return 1;
     }
     if (open_database(parsed, &db) != 0) {
@@ -161,7 +165,7 @@ static int command_ingest(const options *parsed) {
     }
     memset(&source, 0, sizeof(source));
     source.case_id = parsed->case_id;
-    source.kind = "agent_jsonl";
+    source.kind = audit ? "audit_log" : "agent_jsonl";
     source.origin_path = parsed->input;
     source.stored_path = "";
     source.sha256 = hash;
@@ -176,7 +180,12 @@ static int command_ingest(const options *parsed) {
         af_db_rollback(&db);
         goto cleanup;
     }
-    if (af_ingest_jsonl(&db, parsed->case_id, parsed->input, source_id, &count) != 0) {
+    if (audit) {
+        ingest_result = af_ingest_audit(&db, parsed->case_id, parsed->input, parsed->host, source_id, &count);
+    } else {
+        ingest_result = af_ingest_jsonl(&db, parsed->case_id, parsed->input, source_id, &count);
+    }
+    if (ingest_result != 0) {
         set_source_status(&db, source_id, "failed");
         goto cleanup;
     }
@@ -299,7 +308,8 @@ int main(int argc, char **argv) {
         printf("{\"database_initialized\":true,\"schema_version\":%d}\n", AF_SCHEMA_VERSION);
         return 0;
     }
-    if (strcmp(command, "ingest") == 0) return command_ingest(&parsed);
+    if (strcmp(command, "ingest") == 0) return command_ingest(&parsed, 0);
+    if (strcmp(command, "ingest-audit") == 0) return command_ingest(&parsed, 1);
     if (strcmp(command, "collect-tsk") == 0) return command_collect(&parsed);
     if (strcmp(command, "timeline") == 0) return command_timeline(&parsed, 0);
     if (strcmp(command, "analyze") == 0) return command_timeline(&parsed, 1);

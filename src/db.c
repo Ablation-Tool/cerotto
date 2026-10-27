@@ -71,6 +71,7 @@ int af_db_init(af_db *db) {
         " prompt_id TEXT NOT NULL DEFAULT '',"
         " tool_call_id TEXT NOT NULL DEFAULT '',"
         " process_id INTEGER,"
+        " parent_process_id INTEGER,"
         " path TEXT NOT NULL DEFAULT '',"
         " deleted INTEGER CHECK(deleted IN (0,1)),"
         " details_json TEXT NOT NULL DEFAULT '{}'"
@@ -97,7 +98,11 @@ int af_db_init(af_db *db) {
         af_db_rollback(db);
         return -1;
     }
-    if (sqlite3_exec(db->handle, "PRAGMA user_version=" "1", NULL, NULL, NULL) != SQLITE_OK ||
+    if (version == 1 && execute(db, "ALTER TABLE events ADD COLUMN parent_process_id INTEGER") != 0) {
+        af_db_rollback(db);
+        return -1;
+    }
+    if (sqlite3_exec(db->handle, "PRAGMA user_version=" "2", NULL, NULL, NULL) != SQLITE_OK ||
         af_db_commit(db) != 0) {
         af_db_rollback(db);
         return -1;
@@ -190,8 +195,8 @@ int af_db_insert_source(af_db *db, const af_source *source, int64_t *id) {
 int af_db_insert_event(af_db *db, const af_event *event) {
     static const char sql[] =
         "INSERT INTO events(id,case_id,source_id,observed_at,host_id,source_tool,event_type,"
-        "conversation_id,prompt_id,tool_call_id,process_id,path,deleted,details_json) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)";
+        "conversation_id,prompt_id,tool_call_id,process_id,parent_process_id,path,deleted,details_json) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)";
     sqlite3_stmt *statement = NULL;
     if (sqlite3_prepare_v2(db->handle, sql, -1, &statement, NULL) != SQLITE_OK) {
         af_error("cannot prepare event insertion: %s", sqlite3_errmsg(db->handle));
@@ -216,13 +221,18 @@ int af_db_insert_event(af_db *db, const af_event *event) {
     } else {
         sqlite3_bind_null(statement, 11);
     }
-    sqlite3_bind_text(statement, 12, event->path, -1, SQLITE_TRANSIENT);
-    if (event->deleted >= 0) {
-        sqlite3_bind_int(statement, 13, event->deleted);
+    if (event->parent_process_id >= 0) {
+        sqlite3_bind_int64(statement, 12, event->parent_process_id);
     } else {
-        sqlite3_bind_null(statement, 13);
+        sqlite3_bind_null(statement, 12);
     }
-    sqlite3_bind_text(statement, 14, event->details_json, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 13, event->path, -1, SQLITE_TRANSIENT);
+    if (event->deleted >= 0) {
+        sqlite3_bind_int(statement, 14, event->deleted);
+    } else {
+        sqlite3_bind_null(statement, 14);
+    }
+    sqlite3_bind_text(statement, 15, event->details_json, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(statement) != SQLITE_DONE) {
         af_error("cannot insert event %s: %s", event->id, sqlite3_errmsg(db->handle));
         sqlite3_finalize(statement);

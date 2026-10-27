@@ -4,7 +4,7 @@
 #include <sqlite3.h>
 #include <stdint.h>
 
-#define AF_SCHEMA_VERSION 1
+#define AF_SCHEMA_VERSION 2
 
 typedef struct {
     sqlite3 *handle;
@@ -37,6 +37,7 @@ typedef struct {
     const char *prompt_id;
     const char *tool_call_id;
     int64_t process_id;
+    int64_t parent_process_id;
     const char *path;
     int deleted;
     const char *details_json;
