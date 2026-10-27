@@ -1,5 +1,11 @@
 # CEROTTO
 
+By strictly separating LLM-assisted analysis from deterministic evidence collection and execution, CEROTTO avoids granting the model direct host access. 
+
+This reduces the risk of model-initiated destructive actions and constrains unsupported conclusions through evidence-linked citations, though human verification remains necessary.
+
+
+
 CEROTTO is a C11/POSIX evidence pipeline for investigating security incidents involving LLM agents. It correlates structured agent events with preserved host forensic evidence, then lets an LLM explain a bounded timeline with mandatory event-ID citations.
 
 Deterministic tools collect and correlate evidence separately from the analytical layer. The model receives a bounded, metadata-only timeline and has no host credentials, shell, or tool-execution path; its output is never executed. Mandatory citations constrain unsupported event references, but they do not guarantee correct interpretation. Model output is investigative assistance, not a forensic finding, and material claims still require verification.
