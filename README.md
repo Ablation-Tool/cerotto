@@ -1,12 +1,5 @@
 
-<p align="center">
-  <a href="https://github.com/Ablation-Tool/cerotto/actions/workflows/ci.yml"><img src="https://github.com/Ablation-Tool/cerotto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.2.0-grey" alt="Version 0.2.0">
-  <img src="https://img.shields.io/badge/language-C11-grey" alt="C11">
-  <img src="https://img.shields.io/badge/platform-Linux-grey" alt="Linux">
-</p>
-
-**CEROTTO helps investigators trace what an AI agent did on a computer.**
+**CEROTTO investigates AI agents.**
 
 It connects prompts and tool calls to processes, files, network activity, and disk evidence—then produces a reviewable timeline and an optional evidence-cited analysis.
 
