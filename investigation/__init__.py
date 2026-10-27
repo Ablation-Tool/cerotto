@@ -1,4 +1,4 @@
-"""Bounded Ablation investigation support for CEROTTO evidence cases."""
+"""Bounded investigation support for CEROTTO evidence cases."""
 
 from .adapter import AdapterError, CerottoAdapter
 from .engine import InvestigationEngine, InvestigationError, InvestigationResult

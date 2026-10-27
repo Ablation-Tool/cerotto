@@ -51,6 +51,8 @@ class CerottoAdapter:
         for name, value in (("host", host), ("from", from_), ("to", to)):
             if not isinstance(value, str):
                 raise AdapterError(f"{name} must be a string")
+        if self.scope_host and host != self.scope_host:
+            raise AdapterError("host is outside the configured investigation scope")
         base_args = self._timeline_args(host="", from_=from_, to=to, limit=limit)
         base = self._run_json(base_args, "query_timeline")
         allowed_hosts = {event.get("host_id", "") for event in base.get("events", [])}
