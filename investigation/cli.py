@@ -1,4 +1,4 @@
-"""Command-line entry point for Ablation-driven CEROTTO investigations."""
+"""Command-line entry point for CEROTTO investigations."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from .engine import InvestigationEngine, InvestigationError
 
 
 def parser() -> argparse.ArgumentParser:
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[1]
     result = argparse.ArgumentParser(prog="cerotto-investigate")
     sub = result.add_subparsers(dest="command", required=True)
     investigate = sub.add_parser("investigate")
@@ -35,21 +35,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command != "investigate":
         raise SystemExit(2)
-    ablation_repo = os.environ.get("ABLATION_REPO")
-    if ablation_repo:
-        sys.path.insert(0, ablation_repo)
     try:
-        from ablation.analyzers.llm_analyst.transport import AblationTransport
-    except ImportError as exc:
-        print("Ablation is unavailable. Set ABLATION_REPO or add ablation-tool to PYTHONPATH.", file=sys.stderr)
-        return 1
-    try:
+        from .transport import LLMTransport
         adapter = CerottoAdapter(
             args.binary, args.db, args.case, args.conversation,
             scope_host=args.host, scope_from=args.from_, scope_to=args.to,
             default_limit=args.limit,
         )
-        transport = AblationTransport(
+        transport = LLMTransport(
             model=os.environ.get("CEROTTO_MODEL"),
             api_key=os.environ.get("CEROTTO_API_KEY"),
         )

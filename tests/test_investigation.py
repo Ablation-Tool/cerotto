@@ -10,13 +10,12 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from integration.ablation_cerotto.adapter import CerottoAdapter
-from integration.ablation_cerotto.engine import InvestigationEngine, InvestigationError
+from investigation.adapter import CerottoAdapter
+from investigation.engine import InvestigationEngine, InvestigationError
 from test_cerotto import agent_events, audit_lines
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("CEROTTO_BIN", ROOT / "build" / "cerotto")).resolve()
-ABLATION_REPO = os.environ.get("ABLATION_REPO", "/home/cowboy/_projects/ablation-standard")
 
 
 def completion():
@@ -46,7 +45,7 @@ class ScriptedTransport:
 
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="cerotto-ablation-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="cerotto-investigation-test-")
         self.root = Path(self.temporary.name)
         self.addCleanup(self.temporary.cleanup)
         self.db = self.root / "case.db"
@@ -112,6 +111,19 @@ class IntegrationTests(unittest.TestCase):
             InvestigationEngine(self.adapter(), ScriptedTransport([
                 {"action": "query_timeline", "arguments": {"host": "unrelated-host"}},
             ])).run()
+        other_host_event = {
+            "id": "evt-other-host", "observed_at": "2026-10-27T12:00:02Z",
+            "host_id": "agent-vm-2", "source_tool": "agent_gateway",
+            "event_type": "tool_call", "conversation_id": "conv-7",
+        }
+        other_host_source = self.root / "other-host.jsonl"
+        other_host_source.write_text(json.dumps(other_host_event) + "\n")
+        self.cli("ingest", "--db", self.db, "--case", "incident-7", "--input", other_host_source)
+        adapter = CerottoAdapter(str(BINARY), str(self.db), "incident-7", "conv-7", scope_host="agent-vm-1")
+        with self.assertRaisesRegex(InvestigationError, "outside the configured investigation scope"):
+            InvestigationEngine(adapter, ScriptedTransport([
+                {"action": "query_timeline", "arguments": {"host": "agent-vm-2"}},
+            ])).run()
 
     def test_repeated_action_is_unfinished(self):
         action = {"action": "query_timeline", "arguments": {}}
@@ -141,8 +153,7 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(InvestigationError, "unsupported action"):
             InvestigationEngine(self.adapter(), RawTransport('{"action":"shell","arguments":{}}')).run()
 
-    @unittest.skipUnless(Path(ABLATION_REPO, "ablation/analyzers/llm_analyst/transport.py").is_file(), "Ablation checkout unavailable")
-    def test_real_ablation_transport_cli_end_to_end(self):
+    def test_real_transport_cli_end_to_end(self):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
         counter = self.root / "counter"
@@ -171,14 +182,13 @@ print(json.dumps([{'type':'result','result':json.dumps(action)}]))
         env = os.environ.copy()
         env.update({
             "PATH": f"{fake_bin}:{env['PATH']}",
-            "ABLATION_REPO": ABLATION_REPO,
             "FAKE_ROOT": str(self.root),
             "PYTHONPATH": str(ROOT),
         })
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("CEROTTO_API_KEY", None)
         result = subprocess.run(
-            [sys.executable, "-m", "integration.ablation_cerotto.cli", "investigate",
+            [sys.executable, "-m", "investigation.cli", "investigate",
              "--db", str(self.db), "--case", "incident-7", "--conversation", "conv-7"],
             capture_output=True, text=True, env=env, timeout=60, cwd=ROOT,
         )

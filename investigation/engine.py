@@ -67,7 +67,7 @@ class InvestigationEngine:
                 if name == "done":
                     analysis = self._validate_done(arguments)
                     return InvestigationResult(True, {
-                        "engine": "ablation-cerotto-v1",
+                        "engine": "cerotto-investigation-v1",
                         "analysis": analysis,
                         "evidence_event_count": len(self.adapter.known_event_ids),
                         "steps": step,
@@ -170,7 +170,7 @@ class InvestigationEngine:
 
     def _unfinished(self, reason: str, steps: int) -> InvestigationResult:
         return InvestigationResult(False, {
-            "engine": "ablation-cerotto-v1",
+            "engine": "cerotto-investigation-v1",
             "reason": reason,
             "steps": steps,
             "tool_calls": list(self.adapter.calls),

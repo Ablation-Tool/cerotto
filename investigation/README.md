@@ -1,6 +1,8 @@
-# Ablation investigation integration
+# CEROTTO investigation engine
 
-This integration lets Ablation investigate CEROTTO cases through a bounded, read-only interface. Ablation supplies model transport and model routing. CEROTTO supplies evidence, collection controls, and citation enforcement.
+This package provides bounded, iterative investigation over CEROTTO evidence cases. The model proposes actions. CEROTTO validates them, collects the evidence, and checks every citation before accepting a report.
+
+The implementation is self-contained. It does not require Ablation or another repository.
 
 ## How it works
 
@@ -16,18 +18,15 @@ The model reviews the evidence and chooses the next action
 CEROTTO validates the final report and every event citation
 ```
 
-The engine accepts completion only through `done`. It rejects unknown event citations, out-of-scope hosts, unsupported actions, trailing prose, and repeated action loops. Every observation and hypothesis needs at least one event citation.
-
-The integration uses `AblationTransport` from `Ablation-Tool/ablation`. The current Ablation `AgentLoop` remains single-shot. `InvestigationEngine` adds the bounded iterative layer for CEROTTO investigations.
+The engine accepts completion only through `done`. It rejects unknown event citations, out-of-scope hosts, unsupported actions, trailing prose, and repeated action loops. Every observation and hypothesis needs at least one event citation. Completion requires evidence.
 
 ## Run an investigation
 
-Build CEROTTO and make Ablation available:
+Build CEROTTO and expose the package:
 
 ```sh
 make
-export ABLATION_REPO=/path/to/ablation
-export PYTHONPATH="$PWD:$ABLATION_REPO"
+export PYTHONPATH="$PWD"
 ```
 
 Use an Anthropic API key or an available `claude` CLI:
@@ -36,7 +35,7 @@ Use an Anthropic API key or an available `claude` CLI:
 export CEROTTO_MODEL=model-name
 export CEROTTO_API_KEY=key-if-required
 
-python3 -m integration.ablation_cerotto.cli investigate \
+python3 -m investigation.cli investigate \
   --db case.db --case incident-7 --conversation conv-7
 ```
 
@@ -53,7 +52,7 @@ The CLI exits with status 0 for a completed investigation, 2 for an unfinished l
 ## Current limits
 
 - Tests use scripted responses and a fake `claude` executable. They do not test a production model provider.
-- Recovered artifact content, prior-case RAG, and autonomous host actions are not exposed.
+- Recovered artifact content, prior-case retrieval, and autonomous host actions are not exposed.
 - The model cannot run shell commands, issue arbitrary SQL, or leave the selected case and conversation scope.
 - Result size, event count, transcript size, and model steps are bounded.
 - Citations prove that referenced events exist. They do not prove the model's interpretation.
@@ -61,5 +60,5 @@ The CLI exits with status 0 for a completed investigation, 2 for an unfinished l
 ## Verify
 
 ```sh
-python3 -m unittest -v tests.test_ablation_integration
+python3 -m unittest discover -v -s tests -p 'test_*.py'
 ```
