@@ -1,6 +1,5 @@
 
-**CEROTTO investigates AI agents.**
-
+CEROTTO is a digital forensics and incident response (DFIR) tool.
 
 
 ---
