@@ -68,8 +68,6 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 <details>
 <summary><strong>AI Agent Install</strong></summary>
 
-Hand this prompt to your AI coding agent. It builds and checks CEROTTO without accessing evidence or configuring analysis providers.
-
 ```text
 Build CEROTTO from https://github.com/Ablation-Tool/cerotto for me.
 
