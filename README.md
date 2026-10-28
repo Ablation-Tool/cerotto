@@ -66,6 +66,34 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 ## Setup & About
 
 <details>
+<summary><strong>AI Agent Install</strong></summary>
+
+Hand this prompt to your AI coding agent. It builds and checks CEROTTO without accessing evidence or configuring analysis providers.
+
+```text
+Build CEROTTO from https://github.com/Ablation-Tool/cerotto for me.
+
+Check for a C11 compiler, Make, Python 3, a POSIX environment, Sleuth Kit, and
+curl. Report missing prerequisites and ask before installing system packages.
+Clone the repository if it is not already present, then build and test from
+that checkout with:
+
+  make
+  make check
+
+Report the checkout path, compiler version, test result, and the path to
+`build/cerotto`. Keep EWF and real-image tooling optional until I request a
+workflow that needs it.
+
+Do not use sudo, access disks or evidence files, run collection or carving
+commands, create case databases, configure an LLM endpoint, or request API
+credentials during setup. Evidence work requires a separate authorized request
+with explicit input and output paths.
+```
+
+</details>
+
+<details>
 <summary><strong>Install</strong></summary>
 
 **Requirements:** C11 compiler · Make · Python 3 · POSIX · Sleuth Kit · `curl`
