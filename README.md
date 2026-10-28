@@ -14,11 +14,11 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 
 | Capability | Code | Description |
 |:---|:---|:---|
-| [**Agent Event Ingestion**](src/event.c) | [1](src/event.c) | Imports conversations, prompts, tool calls, processes, file events, and network events from validated JSONL records. |
-| [**Linux Audit Attribution**](src/audit.c) | [1](src/audit.c) | Correlates interleaved audit records into process execution, file activity, and network connections with PID/PPID attribution. |
-| [**Raw Disk Timelines**](src/collector_tsk.c) | [1](src/collector_tsk.c) | Collects allocated and deleted filesystem records without mounting or modifying the image. |
-| [**Verified EWF Collection**](src/ewf.c) | [1](src/ewf.c) | Requires successful `ewfverify`, preserves `ewfinfo`, hashes EWF segments, and processes E01 evidence through The Sleuth Kit. |
-| [**Controlled File Carving**](src/carve.c) | [1](src/carve.c) | Runs Foremost or Scalpel, preserves logs, and catalogs recovered files with hashes and acquisition provenance. |
+| [**Agent Event Ingestion**](docs/capabilities.md#agent-event-ingestion) | [1](src/event.c) | Imports conversations, prompts, tool calls, processes, file events, and network events from validated JSONL records. |
+| [**Linux Audit Attribution**](docs/capabilities.md#linux-audit-attribution) | [1](src/audit.c) | Correlates interleaved audit records into process execution, file activity, and network connections with PID/PPID attribution. |
+| [**Raw Disk Timelines**](docs/capabilities.md#raw-disk-timelines) | [1](src/collector_tsk.c) | Collects allocated and deleted filesystem records without mounting or modifying the image. |
+| [**Verified EWF Collection**](docs/capabilities.md#verified-ewf-collection) | [1](src/ewf.c) | Requires successful `ewfverify`, preserves `ewfinfo`, hashes EWF segments, and processes E01 evidence through The Sleuth Kit. |
+| [**Controlled File Carving**](docs/capabilities.md#controlled-file-carving) | [1](src/carve.c) | Runs Foremost or Scalpel, preserves logs, and catalogs recovered files with hashes and acquisition provenance. |
 
 </details>
 
@@ -27,11 +27,11 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 
 | Capability | Code | Description |
 |:---|:---|:---|
-| [**Versioned Evidence Store**](src/db.c) | [1](src/db.c) | Stores cases, sources, and normalized events in SQLite with schema migrations and transactional writes. |
-| [**Deterministic Timelines**](src/timeline.c) | [1](src/timeline.c) | Correlates conversation-linked and same-host activity by UTC time range, host, process, and parent process. |
-| [**Case Manifests**](src/manifest.c) | [1](src/manifest.c) | Exports evidence paths, hashes, sizes, commands, tool versions, acquisition times, and collection status. |
-| [**Evidence Verification**](src/manifest.c) | [1](src/manifest.c) | Recomputes source and preserved-output hashes and reports missing or modified artifacts. |
-| [**Hash-Verified Artifact Inspection**](src/artifact.c) | [1](src/artifact.c) | Revalidates carved files before bounded hex or base64 JSON inspection. Recovered content is never executed. |
+| [**Versioned Evidence Store**](docs/capabilities.md#versioned-evidence-store) | [1](src/db.c) | Stores cases, sources, and normalized events in SQLite with schema migrations and transactional writes. |
+| [**Deterministic Timelines**](docs/capabilities.md#deterministic-timelines) | [1](src/timeline.c) | Correlates conversation-linked and same-host activity by UTC time range, host, process, and parent process. |
+| [**Case Manifests**](docs/capabilities.md#case-manifests) | [1](src/manifest.c) | Exports evidence paths, hashes, sizes, commands, tool versions, acquisition times, and collection status. |
+| [**Evidence Verification**](docs/capabilities.md#evidence-verification) | [1](src/manifest.c) | Recomputes source and preserved-output hashes and reports missing or modified artifacts. |
+| [**Hash-Verified Artifact Inspection**](docs/capabilities.md#hash-verified-artifact-inspection) | [1](src/artifact.c) | Revalidates carved files before bounded hex or base64 JSON inspection. Recovered content is never executed. |
 
 </details>
 
@@ -40,10 +40,10 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 
 | Capability | Code | Description |
 |:---|:---|:---|
-| [**Bounded LLM Analysis**](src/analyze.c) | [1](src/analyze.c) | Sends at most 500 metadata-only events to an OpenAI-compatible endpoint with timeouts and response limits. |
-| [**Citation Validation**](src/analyze.c) | [1](src/analyze.c) | Requires structured observations and hypotheses. Rejects invented event references and mismatched evidence counts. |
-| [**Portable Investigation Reports**](src/report.c) | [1](src/report.c) | Produces JSON or escaped Markdown reports that separate observations, hypotheses, limitations, and human review. |
-| [**Human Review Attestations**](src/report.c) | [1](src/report.c) | Records reviewer identity and decision. An attestation is not a cryptographic signature. |
+| [**Bounded LLM Analysis**](docs/capabilities.md#bounded-llm-analysis) | [1](src/analyze.c) | Sends at most 500 metadata-only events to an OpenAI-compatible endpoint with timeouts and response limits. |
+| [**Citation Validation**](docs/capabilities.md#citation-validation) | [1](src/analyze.c) | Requires structured observations and hypotheses. Rejects invented event references and mismatched evidence counts. |
+| [**Portable Investigation Reports**](docs/capabilities.md#portable-investigation-reports) | [1](src/report.c) | Produces JSON or escaped Markdown reports that separate observations, hypotheses, limitations, and human review. |
+| [**Human Review Attestations**](docs/capabilities.md#human-review-attestations) | [1](src/report.c) | Records reviewer identity and decision. An attestation is not a cryptographic signature. |
 
 </details>
 
@@ -52,67 +52,12 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 
 | Capability | Code | Description |
 |:---|:---|:---|
-| [**No Model-to-Host Execution**](src/analyze.c) | [1](src/analyze.c) | Gives the LLM no shell, host credentials, forensic tools, database writes, or execution path. |
-| [**No-Shell Subprocesses**](src/process.c) | [1](src/process.c) | Executes forensic tools with fixed argument arrays, bounded output, and checked exit status. |
-| [**Evidence Hashing**](src/util.c) | [1](src/util.c) | Computes SHA-256 for source images, preserved output, EWF segments, and recovered artifacts. |
-| [**Transactional Ingestion**](src/event.c) | [1](src/event.c) [2](src/audit.c) [3](src/carve.c) | Rolls back malformed or duplicate records instead of accepting partial evidence sets. |
-| [**Hostile-Artifact Boundaries**](src/carve.c) | [1](src/carve.c) [2](src/artifact.c) | Rejects symlinks and non-regular output, caps recovery size, and keeps recovered bytes out of LLM requests. |
-| [**Regression & Sanitizer CI**](tests/test_cerotto.py) | [1](tests/test_cerotto.py) [2](.github/workflows/ci.yml) | Tests real evidence workflows, failure paths, and normal/ASan/UBSan builds on every push and pull request. |
-
-</details>
-
----
-
-## Setup & About
-
-<details>
-<summary><strong>AI Agent Install</strong></summary>
-
-```text
-Build CEROTTO from https://github.com/Ablation-Tool/cerotto for me.
-
-Check for a C11 compiler, Make, Python 3, a POSIX environment, Sleuth Kit, and
-curl. Report missing prerequisites and stop. Do not install system packages
-or use sudo unless I separately approve the exact command.
-
-Clone the repository if it is absent. For an existing checkout, verify its
-origin and check for uncommitted changes. Do not reset, clean, overwrite, or
-pull over local changes. Stop and ask if the remote differs or the checkout
-is dirty.
-
-Review the Makefile, then build and test from the checkout with:
-
-  make
-  make check
-
-Allow the test suite to create only its documented synthetic artifacts in
-isolated test directories. Do not access real disks or evidence, run
-collection or carving commands, create investigation case databases,
-configure an LLM endpoint, or request API credentials. EWF and evidence work
-require a separate authorized request with explicit input and output paths.
-
-Stop on build or test failures without privileged or alternate-source
-fallbacks. Report the checkout path, compiler version, test results, skipped
-tests, and the path to `build/cerotto`.
-```
-
-</details>
-
-<details>
-<summary><strong>Manual Install</strong></summary>
-
-**Requirements:** C11 compiler · Make · Python 3 · POSIX · Sleuth Kit · `curl`
-
-EWF collection also requires `ewfinfo` and `ewfverify`. Real-image tests use `mke2fs`, `debugfs`, and `ewfacquire`. SQLite and cJSON are pinned in `vendor/`; no C development packages are required.
-
-```bash
-make
-make check
-make sanitize
-make check BUILD_DIR=build/sanitize
-```
-
-The executable is `build/cerotto`.
+| [**No Model-to-Host Execution**](docs/capabilities.md#no-model-to-host-execution) | [1](src/analyze.c) | Gives the LLM no shell, host credentials, forensic tools, database writes, or execution path. |
+| [**No-Shell Subprocesses**](docs/capabilities.md#no-shell-subprocesses) | [1](src/process.c) | Executes forensic tools with fixed argument arrays, bounded output, and checked exit status. |
+| [**Evidence Hashing**](docs/capabilities.md#evidence-hashing) | [1](src/util.c) | Computes SHA-256 for source images, preserved output, EWF segments, and recovered artifacts. |
+| [**Transactional Ingestion**](docs/capabilities.md#transactional-ingestion) | [1](src/event.c)&nbsp;[2](src/audit.c)&nbsp;[3](src/carve.c) | Rolls back malformed or duplicate records instead of accepting partial evidence sets. |
+| [**Hostile-Artifact Boundaries**](docs/capabilities.md#hostile-artifact-boundaries) | [1](src/carve.c)&nbsp;[2](src/artifact.c) | Rejects symlinks and non-regular output, caps recovery size, and keeps recovered bytes out of LLM requests. |
+| [**Regression & Sanitizer CI**](docs/capabilities.md#regression--sanitizer-ci) | [1](tests/test_cerotto.py)&nbsp;[2](.github/workflows/ci.yml) | Tests real evidence workflows, failure paths, and normal/ASan/UBSan builds on every push and pull request. |
 
 </details>
 
@@ -198,6 +143,61 @@ Use CEROTTO only for authorized investigations. Preserve original evidence separ
 
 </details>
 
+---
+
+## Setup & About
+
+<details>
+<summary><strong>AI Agent Install</strong></summary>
+
+```text
+Build CEROTTO from https://github.com/Ablation-Tool/cerotto for me.
+
+Check for a C11 compiler, Make, Python 3, a POSIX environment, Sleuth Kit, and
+curl. Report missing prerequisites and stop. Do not install system packages
+or use sudo unless I separately approve the exact command.
+
+Clone the repository if it is absent. For an existing checkout, verify its
+origin and check for uncommitted changes. Do not reset, clean, overwrite, or
+pull over local changes. Stop and ask if the remote differs or the checkout
+is dirty.
+
+Review the Makefile, then build and test from the checkout with:
+
+  make
+  make check
+
+Allow the test suite to create only its documented synthetic artifacts in
+isolated test directories. Do not access real disks or evidence, run
+collection or carving commands, create investigation case databases,
+configure an LLM endpoint, or request API credentials. EWF and evidence work
+require a separate authorized request with explicit input and output paths.
+
+Stop on build or test failures without privileged or alternate-source
+fallbacks. Report the checkout path, compiler version, test results, skipped
+tests, and the path to `build/cerotto`.
+```
+
+</details>
+
+<details>
+<summary><strong>Manual Install</strong></summary>
+
+**Requirements:** C11 compiler · Make · Python 3 · POSIX · Sleuth Kit · `curl`
+
+EWF collection also requires `ewfinfo` and `ewfverify`. Real-image tests use `mke2fs`, `debugfs`, and `ewfacquire`. SQLite and cJSON are pinned in `vendor/`; no C development packages are required.
+
+```bash
+make
+make check
+make sanitize
+make check BUILD_DIR=build/sanitize
+```
+
+The executable is `build/cerotto`.
+
+</details>
+
 <details>
 <summary><strong>Development and verification</strong></summary>
 
@@ -219,5 +219,14 @@ Tests use generated evidence and a local mock LLM. They do not contact external 
 CEROTTO is built for authorized security research and incident response. Use it only on systems and evidence you own or have explicit permission to investigate.
 
 Report bugs through [GitHub Issues](https://github.com/Ablation-Tool/cerotto/issues).
+
+</details>
+
+<details>
+<summary><strong>License</strong></summary>
+
+CEROTTO is proprietary software provided for authorized security research and educational use. The license does not grant permission to copy, modify, distribute, sublicense, sell, transfer, or reverse engineer the software. Commercial use requires express written permission.
+
+See [LICENSE](LICENSE) for the full restrictions and licensing contact information.
 
 </details>
