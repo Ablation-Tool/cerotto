@@ -61,6 +61,8 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 
 </details>
 
+## Operations
+
 <details>
 <summary><strong>Investigate a case</strong></summary>
 
