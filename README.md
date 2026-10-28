@@ -94,7 +94,7 @@ with explicit input and output paths.
 </details>
 
 <details>
-<summary><strong>Install</strong></summary>
+<summary><strong>Manual Install</strong></summary>
 
 **Requirements:** C11 compiler · Make · Python 3 · POSIX · Sleuth Kit · `curl`
 
