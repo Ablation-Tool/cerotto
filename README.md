@@ -72,21 +72,28 @@ CEROTTO helps incident responders, security engineers, and forensic analysts ans
 Build CEROTTO from https://github.com/Ablation-Tool/cerotto for me.
 
 Check for a C11 compiler, Make, Python 3, a POSIX environment, Sleuth Kit, and
-curl. Report missing prerequisites and ask before installing system packages.
-Clone the repository if it is not already present, then build and test from
-that checkout with:
+curl. Report missing prerequisites and stop. Do not install system packages
+or use sudo unless I separately approve the exact command.
+
+Clone the repository if it is absent. For an existing checkout, verify its
+origin and check for uncommitted changes. Do not reset, clean, overwrite, or
+pull over local changes. Stop and ask if the remote differs or the checkout
+is dirty.
+
+Review the Makefile, then build and test from the checkout with:
 
   make
   make check
 
-Report the checkout path, compiler version, test result, and the path to
-`build/cerotto`. Keep EWF and real-image tooling optional until I request a
-workflow that needs it.
+Allow the test suite to create only its documented synthetic artifacts in
+isolated test directories. Do not access real disks or evidence, run
+collection or carving commands, create investigation case databases,
+configure an LLM endpoint, or request API credentials. EWF and evidence work
+require a separate authorized request with explicit input and output paths.
 
-Do not use sudo, access disks or evidence files, run collection or carving
-commands, create case databases, configure an LLM endpoint, or request API
-credentials during setup. Evidence work requires a separate authorized request
-with explicit input and output paths.
+Stop on build or test failures without privileged or alternate-source
+fallbacks. Report the checkout path, compiler version, test results, skipped
+tests, and the path to `build/cerotto`.
 ```
 
 </details>
