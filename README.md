@@ -227,8 +227,8 @@ Report bugs through [GitHub Issues](https://github.com/Ablation-Tool/cerotto/iss
 <details>
 <summary><strong>License</strong></summary>
 
-CEROTTO is proprietary software provided for authorized security research and educational use. The license does not grant permission to copy, modify, distribute, sublicense, sell, transfer, or reverse engineer the software. Commercial use requires express written permission.
+CEROTTO is free and open-source software under the [MIT License](LICENSE). You may use, modify, and distribute it, including for commercial purposes, provided the copyright and license notice are retained. The software is provided without warranty.
 
-See [LICENSE](LICENSE) for the full restrictions and licensing contact information.
+Responsible-use requirements still apply to investigations. Use CEROTTO only on systems and evidence you own or have explicit permission to investigate.
 
 </details>
