@@ -357,6 +357,32 @@ int af_sha256_file(const char *path, char output[65]) {
     return 0;
 }
 
+int af_sha256_raw(const void *data, size_t length, unsigned char output[32]) {
+    sha256_context context;
+    if ((!data && length) || !output) {
+        return -1;
+    }
+    sha256_init(&context);
+    sha256_update(&context, data, length);
+    sha256_final(&context, output);
+    return 0;
+}
+
+int af_sha256_bytes(const void *data, size_t length, char output[65]) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned char digest[32];
+    int i;
+    if (af_sha256_raw(data, length, digest) != 0) {
+        return -1;
+    }
+    for (i = 0; i < 32; ++i) {
+        output[i * 2] = hex[digest[i] >> 4];
+        output[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    output[64] = '\0';
+    return 0;
+}
+
 int af_write_new_file(const char *path, const void *data, size_t length) {
     int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     const unsigned char *cursor = data;

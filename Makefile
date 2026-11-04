@@ -7,7 +7,7 @@ CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror
 LDLIBS += -lm
 
-APP_SOURCES := src/main.c src/db.c src/event.c src/audit.c src/ewf.c src/carve.c src/artifact.c src/manifest.c src/report.c src/process.c src/util.c src/collect.c src/collector_tsk.c src/timeline.c src/analyze.c
+APP_SOURCES := src/main.c src/db.c src/event.c src/audit.c src/ewf.c src/carve.c src/artifact.c src/manifest.c src/report.c src/process.c src/util.c src/collect.c src/collector_tsk.c src/timeline.c src/analyze.c src/forecast.c src/guard.c src/crypto.c src/gemseal.c src/vault.c src/vault_sensor.c src/vault_release.c src/vault_correlate.c src/vault_response.c src/vault_crack.c
 VENDOR_SOURCES := vendor/sqlite/sqlite3.c vendor/cjson/cJSON.c
 OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(APP_SOURCES) $(VENDOR_SOURCES))
 DEPS := $(OBJECTS:.o=.d)
