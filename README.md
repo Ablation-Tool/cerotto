@@ -117,6 +117,10 @@ python3 -m cerotto_gem \
 
 The equivalent launcher is `integration/cerotto-gem`.
 
+The following real GTK screenshot shows a synthetic nine-event demonstration case and a successful guarded `query_timeline` action. The accessible-volume sweep is computed from the distribution `[0.70, 0.20, 0.08, 0.02]`, so three alternatives exceed `τ = 0.05`. No real incident data is shown.
+
+![CEROTTO GEM synthetic case and accessible-volume sweep](docs/images/cerotto-gem-accessible-volume.png)
+
 Embed the user's actual interactive agent explicitly:
 
 ```bash
