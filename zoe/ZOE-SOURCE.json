@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "identity": "ZOE is allgems",
+  "repository": "https://github.com/Ablation-Tool/zoe",
+  "revision": "8ac90bb7364d27eb4814498c93a2b7c00ef109f6",
+  "import": "git archive",
+  "host": {
+    "repository": "https://github.com/Ablation-Tool/cerotto",
+    "components": ["cerotto"],
+    "duplicate_path_excluded": "components/cerotto",
+    "detection": "The host checkout is used when the Cerotto component anchor exists; ZOE_CEROTTO_ROOT overrides it."
+  },
+  "repository_policy": "Generated unified evidence, case databases, reports, and build output are excluded."
+}

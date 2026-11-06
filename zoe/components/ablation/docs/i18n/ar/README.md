@@ -1,0 +1,281 @@
+<img src="../../../assets/branding/woven-diamond/repo/logo.png" width="160" alt="Ablation GEM woven diamond">
+
+![](https://komarev.com/ghpvc/?username=Ablation-Tool&color=grey)
+
+[English](../../../README.md) · [Español](../es/README.md) · [Português](../pt-BR/README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [中文](../zh/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · **العربية** · [한국어](../ko/README.md) · [हिन्दी](../hi/README.md) · [Italiano](../it/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · [Indonesia](../id/README.md) · [Polski](../pl/README.md) · [Nederlands](../nl/README.md)
+
+Ablation هو إطار عمل للهندسة العكسية يوفر نفس قدرات التفكيك والتحليل الثنائي الأساسية التي تقدمها أدوات صناعية مثل Ghidra وIDA Pro وBinary Ninja.
+
+بالدمج مع Claude Code أو OpenAI Codex، يتحول إلى أداة هندسة عكسية مستقلة.
+
+---
+
+![عرض Codex](../../../assets/demos/screencast-2026-09-30.gif)
+
+## القدرات
+
+**البحث الدلالي عبر BERT:** يبحث في الكود بالمفهوم لا بالكلمات الدقيقة. بتعيين المعنى الحقيقي للنص، يخترق أكبر عائق في الهندسة العكسية ليساعدك على تحديد الثغرات بشكل أسرع.
+
+**أداء استثنائي:** يُحمِّل الملفات الثنائية الضخمة في ثوانٍ لا ساعات. بتحليل الكود الذي تراه فعلياً فقط، يتخطى المعالجة الأولية الثقيلة للأدوات التقليدية لتبدأ الهندسة العكسية فوراً.
+
+**مقارنة الإصدارات:** يحلل السلوك الفعلي للبرامج المحدَّثة للتحقق من تصحيحات المورد. يخترق إعادة التغليف السطحية للتأكد مما إذا كانت الثغرة قد أُصلحت فعلاً أم مجرد إخفاء.
+
+**التحليل عبر الملفات الثنائية:** يحلل كل مكتبة مشتركة في صورة البرامج الثابتة في آنٍ واحد، متتبعاً تدفقات البيانات عبر حدود الملفات الثنائية.
+
+**تدقيق الكود المصدري:** يراجع أي قاعدة كود كبيرة بسرعة أكبر من القراءة الخطية، بدقة أعلى من مطابقة الأنماط وحدها. يحصل كل ملف مصدر على ملف أمان من 5 بتات يحدد بالضبط القدر من الاهتمام الذي يحتاجه، لذا لا يُفوَّت شيء ولا يُقرأ شيء مرتين.
+
+**تحليل مشغلات Windows Kernel وBYOVD:** يفحص مشغلات النواة بحثاً عن نقاط دخول خطرة لمنع المهاجمين من استخدام مشغلات موقَّعة وضعيفة لتجاوز برامج الأمان.
+
+**تحليل Android وAPK:** يرسم سطوح هجوم تطبيقات Android دون الحاجة إلى فك تجميع الكود. يفحص المكتبات الداخلية تلقائياً ويرتبها حسب مخاطر الأمان، مما يتيح استهداف المكونات الأكثر ضعفاً على الفور.
+
+**تحليل Erlang وBEAM:** يفحص بأمان كود بايت Erlang لإبراز الدوال الخطرة وسطوح الهجوم المخفية فوراً دون تشغيل التطبيق.
+
+**التحليل التشفيري**
+
+تزيل Ablation كل طبقة تجعل التشفير غير مرئي في الملف الثنائي المُجمَّع. يحدد Entropy Mapper المنطقة المشفرة. يُحدد Crypto Audit وHashAlgoDiscriminator الخوارزمية. يكسر XorSolver وBmpKeyExtractor وCustomCBCDetector التشفير أو يستعيدان المفتاح. يُعيد ELFVtableReconstructor وVtableDispatchScanner بناء ما يفعله وقت التشغيل بالنتيجة.
+
+يمكن للملف الثنائي إخفاء تشفيره عن تحليل جدول الاستيراد وجداول الرموز والبحث النصي. تسد هذه الأدوات الثمانية تلك الفجوة معاً، لتعرف في النهاية الخوارزمية والمفتاح والنص المشفر.
+
+---
+
+## نتائج حقيقية
+
+استُخدم Ablation لتحليل البرامج الثابتة في بيئات الإنتاج ومشغلات النواة من Cisco وFortinet وTencentOS وHuawei وDahua Security System وغيرها.
+
+في أعقاب الإفصاح المنسق عن Cisco FMC وISE، اعتمد فريق Cisco Product Security Incident Response Team (PSIRT) برنامج Ablation للفرز الداخلي للثغرات. يستخدمه Cisco PSIRT بنشاط لفرز تقارير الإفصاح الجارية في Firepower Threat Defense (FTD) وCisco Secure Client (AnyConnect) وCatalyst. كما خضع Cisco Adaptive Security Appliance (ASA) LINA للهندسة العكسية باستخدام Ablation، مع اكتشافات قيد الفرز المنسق حالياً عبر CERT/CC VINCE.
+
+| CVE | المنتج | العنوان | CVSS |
+|---|---|---|---|
+| [CVE‑2026‑76420](https://sec.cloudapps.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-fmc2-multivulns-HXgcqRG) | Secure Firewall Management Center (FMC) | Peer Impersonation | 9.0 Critical |
+| [CVE‑2026‑76412](https://sec.cloudapps.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-fmc2-multivulns-HXgcqRG) | Secure Firewall Management Center (FMC) | Privilege Escalation to root | 8.5 High |
+| [CVE‑2026‑76413](https://sec.cloudapps.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-fmc2-multivulns-HXgcqRG) | Secure Firewall Management Center (FMC) | Single Sign-On Token Forgery | 8.5 High |
+| [CVE‑2026‑76447](https://sec.cloudapps.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-ise-multiauth-bypass-sgD2HbL4) | Identity Services Engine (ISE) | OCSP Responder Authentication Bypass | 5.3 Medium |
+
+---
+
+## أدوات فك التجميع
+
+| ISA / Runtime | المتغيرات |
+|---|---|
+| x86 | x86-32 · x86-64 |
+| ARM | ARM-32 · ARM-64 |
+| MIPS | MIPS-32 · nanoMIPS · MIPS-64 |
+| PowerPC | PPC-32 · PPC-64 |
+| RISC-V | RISC-V 32 · RISC-V 64 |
+| ARC | ARC EM/HS |
+| V850 | V850-32 |
+| LoongArch | LoongArch64 |
+| DEX | Dalvik · ART |
+| ARK | ArkTS |
+| BEAM | Erlang · Elixir |
+
+---
+
+## توافق LLM
+
+| المزود | النماذج |
+|---|---|
+| **Claude Code** | /model claude-sonnet-4-6 |
+| **OpenAI Codex** | جميع النماذج المعروفة |
+
+---
+
+## التثبيت
+
+```bash
+pip install git+https://github.com/Ablation-Tool/ablation
+```
+
+---
+
+## المتطلبات
+
+- Python >= 3.10
+- `capstone`, `numpy`, `lief`, `sentence-transformers`, `pyelftools`
+
+---
+
+## الاستخدام المسؤول
+
+بُني Ablation للبحث الأمني المصرح به. استخدمه فقط ضد الأنظمة التي تملكها أو التي تمتلك إذناً كتابياً صريحاً لاختبارها. تشغيله ضد أنظمة دون تصريح يُعدّ انتهاكاً لقوانين الاحتيال الحاسوبي في معظم الولايات القضائية. المؤلفون ليسوا مسؤولين عن سوء الاستخدام.
+
+---
+
+## شكر وتقدير
+
+تأثّر هذا المشروع بعمق بعدد من الأعمال الأدبية الرئيسية وأُلهم بها.
+
+**أوراق بحثية**
+
+| العنوان | المؤلفون | الاستشهاد |
+|---|---|---|
+| [Reverse Compilation Techniques](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=iseZ69MAAAAJ&citation_for_view=iseZ69MAAAAJ:u-x6o8ySG0sC) · [Specifying the Semantics of Machine Instructions](https://ieeexplore.ieee.org/document/693702) · [UQBT: Adaptable Binary Translation at Low Cost](https://ieeexplore.ieee.org/document/825697) · [Machine-Adaptable Dynamic Binary Translation](https://dl.acm.org/doi/10.1145/351397.351414) | [Dr. Cristina Cifuentes](https://scholar.google.com/citations?hl=en&user=iseZ69MAAAAJ) | [abc_parser.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/abc_parser.py) · [abc_disasm.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/abc_disasm.py) · [abc_decompiler.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/abc_decompiler.py) · [dataflow_engine.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/dataflow_engine.py) · [loongarch_decoder_v2.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/loongarch_decoder_v2.py) |
+| [Design of a Retargetable Decompiler for a Static Platform-Independent Malware Analysis](https://www.researchgate.net/publication/220849941_Design_of_a_Retargetable_Decompiler_for_a_Static_Platform-Independent_Malware_Analysis) | [Petr Zemek](https://github.com/s3rvac), Lukáš Ďurfina, Jakub Křoustek, Dušan Kolář, Tomas Hruska, Karel Masařík, Alexander Meduna | [abc_decompiler.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/abc_decompiler.py) |
+| [Finding Taint-Style Vulnerabilities in Linux-based Embedded Firmware with SSE-based Alias Analysis](https://arxiv.org/abs/2109.12209) | Cheng, Zheng, Liu, Guan, Liu, Li, Zhu, Ye, Sun | [sse_slicer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/sse_slicer.py) · [arm64_global_tracker.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/arm64_global_tracker.py) |
+| [iResolveX: Multi-Layered Indirect Call Resolution via Static Reasoning and Learning-Augmented Refinement](https://arxiv.org/abs/2601.17888) | Monika Santra, Bokai Zhang, Mark Lim, [Vishnu Asutosh Dasu](https://github.com/vdasu), Dongrui Zeng, [Gang Tan](https://github.com/gangtan) | [vtable_resolver.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/vtable_resolver.py) · [interproc_field_writer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/interproc_field_writer.py) · [arm64_global_tracker.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/arm64_global_tracker.py) |
+| [Extracting Protocol Format as State Machine via Controlled Static Loop Analysis](https://arxiv.org/abs/2305.13483) | [Qingkai Shi](https://github.com/qingkaishi), Xiangzhe Xu, Xiangyu Zhang | [proto_fsm.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/proto_fsm.py) |
+| [NEMETYL: Message Type Identification of Binary Network Protocols using Continuous Segment Similarity](https://arxiv.org/abs/2002.03391) | [Stephan Kleber](https://github.com/vs-uulm), Rens Wouter van der Heijden, [Frank Kargl](https://github.com/fkargl) | [proto_fsm.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/proto_fsm.py) |
+| [Imperfect Forward Secrecy: How Diffie-Hellman Fails in Practice](https://dl.acm.org/doi/10.1145/2810103.2813707) | [David Adrian](https://github.com/dadrian), Karthikeyan Bhargavan, [Zakir Durumeric](https://github.com/zakird), Pierrick Gaudry, Matthew Green, [J. Alex Halderman](https://github.com/jhalderm), [Nadia Heninger](https://github.com/factorable), Drew Springall, Emmanuel Thomé, [Luke Valenta](https://github.com/lukevalenta) | [tls_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/tls_analyzer.py) |
+| [Nonce-Disrespecting Adversaries: Practical Forgery Attacks on GCM in TLS](https://www.usenix.org/conference/woot16/workshop-program/presentation/bock) | [Hanno Böck](https://github.com/hannob), [Aaron Zauner](https://github.com/azet), Sean Devlin, [Juraj Somorovsky](https://github.com/jurajsomorovsky), [Philipp Jovanovic](https://github.com/Daeinar) | [tls_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/tls_analyzer.py) |
+| [Whitening Sentence Representations for Better Semantics and Faster Retrieval](https://arxiv.org/abs/2103.15316) | [Jianlin Su](https://github.com/bojone), [Jiarun Cao](https://github.com/jiaruncao), Weijie Liu, Yangyiwen Ou | [semantic_search.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/semantic_search.py) |
+| [Constant Propagation with Conditional Branches](https://dl.acm.org/doi/abs/10.1145/103135.103136) | Mark N. Wegman, F. Kenneth Zadeck | [dataflow_engine.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/dataflow_engine.py) |
+| [A Simple, Fast Dominance Algorithm](https://www.cs.princeton.edu/techreports/2005/737.pdf) | Cooper, Harvey, Kennedy | [dataflow_engine.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/dataflow_engine.py) |
+| [libdft: Practical Dynamic Data Flow Tracking for Commodity Systems](https://dl.acm.org/doi/10.1145/2151024.2151042) | [Vasileios P. Kemerlis](https://github.com/vkemerlis), [Georgios Portokalidis](https://github.com/portokalidis), [Kangkook Jee](https://github.com/jikk), Angelos D. Keromytis | [taint_tracker_x86.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/taint_tracker_x86.py) · [taint_tracker_arm32.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/taint_tracker_arm32.py) |
+
+**كتب** مقدمة من [www.oreilly.com](https://www.oreilly.com) | [github.com/oreillymedia](https://github.com/oreillymedia)
+
+| العنوان | المؤلفون | الاستشهاد |
+|---|---|---|
+| The Art of Software Security Assessment | [Mark Dowd](https://github.com/mdowd79), John McDonald, [Justin Schuh](https://github.com/jschuh) | [heap_vuln_scanner.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/heap_vuln_scanner.py) · [format_string_scanner.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/format_string_scanner.py) · [ioctl_attack_surface.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/ioctl_attack_surface.py) |
+| Practical Binary Analysis | [Dennis Andriesse](https://github.com/dennisaa) | [taint_tracker_x86.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/taint_tracker_x86.py) · [disasm_engine.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/disasm_engine.py) |
+| Practical Malware Analysis | Michael Sikorski, Andrew Honig | [pe_parser.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/pe_parser.py) · [shellcode_utils.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/shellcode_utils.py) |
+| Practical Reverse Engineering | Bruce Dang, Alexandre Gazet, [Elias Bachaalany](https://github.com/0xeb) | [pe_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/pe_analyzer.py) · [kernel_driver_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/kernel_driver_analyzer.py) |
+| Hacking: The Art of Exploitation (2e) | Jon Erickson | [platform_detect.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/platform_detect.py) |
+| Learning Linux Binary Analysis | [Ryan O'Neill](https://github.com/elfmaster) | [elf_parser.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/elf_parser.py) · [binary_parser.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/binary_parser.py) |
+| Windows Internals Part 1 & 2 | [Pavel Yosifovich](https://github.com/zodiacon), [Mark Russinovich](https://github.com/markrussinovich), David Solomon, [Alex Ionescu](https://github.com/ionescu007), [Andrea Allievi](https://github.com/AaLl86) | [kernel_driver_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/kernel_driver_analyzer.py) · [ioctl_attack_surface.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/ioctl_attack_surface.py) |
+| Rootkits: Subverting the Windows Kernel | Greg Hoglund, Jamie Butler | [kernel_driver_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/kernel_driver_analyzer.py) · [yara_generator.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/yara_generator.py) |
+| Advanced Compiler Design and Implementation | Steven Muchnick | [dataflow_engine.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/dataflow_engine.py) |
+| Engineering a Compiler | Keith Cooper, Linda Torczon | [disasm_engine.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/disasm_engine.py) |
+| Practical IoT Hacking | [Fotios Chantzis](https://github.com/ithilgore), Ioannis Stais, Paulino Calderon, Evangelos Deirmentzoglou, Beau Woods | [firmware_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/firmware_analyzer.py) |
+| Inside the Android OS: Building, Customizing, Managing and Operating Android System Services | [G. Blake Meike](https://github.com/bmeike) | [apk_parser.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/apk_parser.py) · [jni_bridge_scanner.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/jni_bridge_scanner.py) · [binder_scanner.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/analyzers/binder_scanner.py) |
+| Malware Analysis and Detection Engineering | [Abhijit Mohanta](https://github.com/amohanta), Anoop Saldanha | [yara_generator.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/yara_generator.py) |
+| Evasive Malware | [Kyle Cucci](https://github.com/d4rksystem) | [process_enum.py](https://github.com/Ablation-Tool/ablation/blob/main/modules/process_enum.py) |
+| Hacking Cryptography | [Kamran Khan](https://github.com/krkhan), [Bill Cox](https://github.com/waywardgeek) | [tls_enum.py](https://github.com/Ablation-Tool/ablation/blob/main/modules/tls_enum.py) |
+| Real-World Cryptography | David Wong | [tls_analyzer.py](https://github.com/Ablation-Tool/ablation/blob/main/ablation/core/tls_analyzer.py) |
+
+**إشارة خاصة**
+
+[Microsoft Excel (Data Analysis ToolPak)](https://support.microsoft.com/en-us/office/use-the-analysis-toolpak-to-perform-complex-data-analysis-6c67ccf0-f4a9-487c-8dec-bdb5a2cefab6) عند تحليل البنية التحتية المغلقة أو تأمين الأنظمة المبهمة، تُسمّى هذه العملية بالضبط تحليل التوقيت أو الهندسة العكسية للقياس عن بعد. بدون كود مصدري، يفكك Data Analysis ToolPak رياضياً كيفية عمل التطبيق من خلال مراقبة مدخلاته ومخرجاته بدقة.
+
+---
+
+## معمارية الإطار وتنسيق الوحدات
+
+```mermaid
+flowchart TD
+    Binary(["<b>Target Binary</b><br/><i>ELF · PE · firmware</i>"]):::input
+    Claude(["<b>Claude Code (Orchestrator)</b><br/><i>Central Agent Controller</i>"]):::input
+
+    Binary:::input -->|"load"| BCtx["<b>BinaryContext</b><br/><i>PLT · Strings · Call Graph · XRefs</i>"]:::primary
+    BCtx:::primary -->|"context"| Corpus["<b>Corpus Builder</b><br/><i>Semantic Embedding DB</i>"]:::tertiary
+    BCtx:::primary -->|"context"| Taint(["<b>Taint Engine</b><br/><i>Data Flow / Sinks</i>"]):::output
+    BCtx:::primary -->|"context"| Diffing(["<b>Diffing Engine</b><br/><i>DTW / Version Delta</i>"]):::output
+    BCtx:::primary -->|"context"| FmtStr(["<b>Format String</b><br/><i>Specifier Scanner</i>"]):::output
+    BCtx:::primary -->|"context"| Heap(["<b>Heap Scanner</b><br/><i>Chunk / UAF Audit</i>"]):::output
+    BCtx:::primary -->|"context"| MultiArch(["<b>Multi-Arch Engine</b><br/><i>MIPS · PPC · RISC-V · ARC · V850 · LoongArch64</i>"]):::output
+    BCtx:::primary -->|"context"| Driver(["<b>Driver Engine</b><br/><i>Kernel IOCTL / BYOVD Audit</i>"]):::output
+
+    Corpus:::tertiary -->|"embeddings"| Semantic(["<b>Semantic Search</b><br/><i>BERT Behavioral Fingerprints</i>"]):::output
+
+    Semantic:::output
+    Taint:::output
+    Diffing:::output
+    FmtStr:::output
+    Heap:::output
+    MultiArch:::output
+    Driver:::output
+
+    Claude:::input -->|"confirmed finding"| Registry["<b>Finding Registry</b><br/><i>Cross-Target Corpus</i>"]:::secondary
+    Registry:::secondary -->|"seeds future sweeps"| Semantic:::output
+    classDef input     fill:#0d47a1,stroke:#1565c0,color:#fff
+    classDef primary   fill:#e65100,stroke:#bf360c,color:#fff
+    classDef secondary fill:#004d40,stroke:#00695c,color:#fff
+    classDef tertiary  fill:#4a148c,stroke:#6a1b9a,color:#fff
+    classDef neutral   fill:#37474f,stroke:#546e7a,color:#fff
+    classDef output    fill:#1b5e20,stroke:#2e7d32,color:#fff
+    linkStyle 0 stroke:#bf360c,stroke-width:2px
+    linkStyle 1 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 2 stroke:#2e7d32,stroke-width:3px
+    linkStyle 3 stroke:#2e7d32,stroke-width:3px
+    linkStyle 4 stroke:#2e7d32,stroke-width:3px
+    linkStyle 5 stroke:#2e7d32,stroke-width:3px
+    linkStyle 6 stroke:#2e7d32,stroke-width:3px
+    linkStyle 7 stroke:#2e7d32,stroke-width:3px
+    linkStyle 8 stroke:#2e7d32,stroke-width:3px
+    linkStyle 9 stroke:#00695c,stroke-width:2px
+    linkStyle 10 stroke:#2e7d32,stroke-width:3px
+```
+
+---
+
+## مثال على سير عمل الهندسة العكسية
+
+تحليل شامل من البداية إلى النهاية للملفات الثنائية المجردة من حزمة RPM. الاستخراج عبر BinaryContext ومراجع السلاسل وتفكيك Capstone حتى الاكتشافات المؤكدة.
+
+```mermaid
+flowchart TD
+    RPM(["target-package.rpm<br/>third-party bundle · x86-64"]):::input
+
+    RPM:::input -->|rpm2cpio / cpio| EXTRACT["platform/linux-x86_64/"]:::primary
+
+    EXTRACT:::primary --> PI["bin/inference_engine<br/>stripped PIE · x86-64"]:::secondary
+    EXTRACT:::primary --> CTRL(["bin/controller<br/>stripped PIE · x86-64"]):::output
+    EXTRACT:::primary --> LIBS["lib/libcore.so<br/>lib/libruntime.so"]:::tertiary
+
+    subgraph TRACK_PI ["inference engine track"]
+    direction(["direction"]):::input
+    BCI["BinaryContext.load_or_build()<br/>32 func starts · 551 strings · PLT built"]:::tertiary
+    BCI:::tertiary --> SS["ctx.strings scan<br/>api_op_read VA 0x51560<br/>api_op_write VA 0x51570<br/>license_key_flag 0x52e08"]:::tertiary
+    SS:::tertiary --> XREF["ctx.string_xrefs()<br/>both ops xref → 0x17499, 0x174af<br/>ctx.func_containing() → init fn 0x10000"]:::tertiary
+    XREF:::tertiary --> DA1["capstone disasm 0x17450<br/>lea rsi → api_op_read · call set::insert<br/>lea rsi → api_op_write · call set::insert<br/>CONFIRMED: exactly 2 blocklist entries"]:::tertiary
+    DA1:::tertiary --> DA2["capstone disasm 0x16511<br/>cmp qword ptr [r9], 0<br/>je → model loads · ne → handleFatal<br/>empty set = bypass confirmed"]:::tertiary
+    end
+
+    subgraph TRACK_LIBS ["library analysis"]
+    direction:::input
+    NM["nm -D libcore.so<br/>spawn at 0xfdb20 · ctor at 0xfcfd0"]:::tertiary
+    NM:::tertiary --> DA3["capstone disasm libcore.so:0xfdbc7<br/>cmp entry length == exe_path length<br/>memcmp at 0xfdbdb<br/>proper equality check · no prefix bypass"]:::tertiary
+    LSCAN["re.findall api_op:: in libruntime.so<br/>2481 distinct ops found<br/>2 blocked · 2479 unblocked"]:::tertiary
+    end
+
+    subgraph TRACK_CTRL ["controller track"]
+    direction:::input
+    BCC["BinaryContext.load_or_build()<br/>18 func starts · PLT · strings"]:::tertiary
+    BCC:::tertiary --> XREF2["ctx.string_xrefs() on 5 path strings<br/>./worker1 · ./worker2<br/>./worker3 · ./worker4<br/>./inference_engine<br/>all xref at 0x9a04-0x9a5e"]:::tertiary
+    XREF2:::tertiary --> DA4["capstone disasm 0x99e9<br/>call CApp::progDir()<br/>call OsUtils::chdir()<br/>chdir to binary dir before spawn"]:::tertiary
+    DA4:::tertiary --> DA5["capstone disasm 0x11500<br/>args vector from command pipe tokens<br/>passed raw to spawn() at 0x11699<br/>no validation"]:::tertiary
+    end
+
+    PI:::secondary --> BCI:::tertiary
+    PI:::secondary --> BCC:::tertiary
+    LIBS:::tertiary --> NM:::tertiary
+    LIBS:::tertiary --> LSCAN:::tertiary
+
+    DA2:::tertiary --> F1(["F1"]):::output
+    LSCAN:::tertiary --> F1:::output
+
+    DA3:::tertiary --> F2(["F2"]):::output
+    XREF2:::tertiary --> F2:::output
+
+    DA5:::tertiary --> F2:::output
+
+    SS:::tertiary --> F3(["F3 · INFO<br/>license gate = JSON field only<br/>no cryptographic verification"]):::output
+    classDef input     fill:#0d47a1,stroke:#1565c0,color:#fff
+    classDef primary   fill:#e65100,stroke:#bf360c,color:#fff
+    classDef secondary fill:#004d40,stroke:#00695c,color:#fff
+    classDef tertiary  fill:#4a148c,stroke:#6a1b9a,color:#fff
+    classDef neutral   fill:#37474f,stroke:#546e7a,color:#fff
+    classDef output    fill:#1b5e20,stroke:#2e7d32,color:#fff
+    linkStyle 0 stroke:#bf360c,stroke-width:2px
+    linkStyle 1 stroke:#00695c,stroke-width:2px
+    linkStyle 2 stroke:#2e7d32,stroke-width:3px
+    linkStyle 3 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 4 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 5 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 6 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 7 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 8 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 9 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 10 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 11 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 12 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 13 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 14 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 15 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 16 stroke:#2e7d32,stroke-width:3px
+    linkStyle 17 stroke:#2e7d32,stroke-width:3px
+    linkStyle 18 stroke:#2e7d32,stroke-width:3px
+    linkStyle 19 stroke:#2e7d32,stroke-width:3px
+    linkStyle 20 stroke:#2e7d32,stroke-width:3px
+    linkStyle 21 stroke:#2e7d32,stroke-width:3px
+```

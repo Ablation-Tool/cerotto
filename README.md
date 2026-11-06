@@ -4,6 +4,23 @@ CEROTTO investigates attacks involving autonomous AI agents and sandbox escapes.
 
 CEROTTO GEM is the native graphical workbench. It is a desktop application built with GTK3, the Linux UI toolkit used by GNOME applications, not a web page. It shows investigation timelines, defense events, vault activity, and accessible-volume charts. It can also embed the user's own AI command-line agent in a terminal inside the window.
 
+## ZOE · allgems
+
+**ZOE is the GEM, but the GEM is not ZOE. ZOE is allgems.** The complete ZOE component is included in `zoe/`, with its native Cognitive Field, Bayesian memory, geometry, replayable knowledge graph, unified hub, and the other GEM source trees. Cerotto supplies the `cerotto` component as the host, so its source is not duplicated under `zoe/components/`. The other nine upstream source trees, including Ablation, remain bundled. The imported ZOE revision is recorded in [`zoe/ZOE-SOURCE.json`](zoe/ZOE-SOURCE.json).
+
+Install and inspect the unified hub:
+
+```bash
+python -m pip install ./zoe/guiai-lab
+export ZOE_ROOT="$PWD/zoe"
+export ZOE_CEROTTO_ROOT="$PWD"
+zoe
+zoe list
+zoe launch cerotto -- --help
+```
+
+The `cerotto` entry resolves to this checkout. No component or AI agent starts automatically. Guarded cases still require an explicit case database, case ID, and conversation ID. Newly generated unified evidence, case databases, reports, and build output are excluded from the import. Existing upstream research sources are preserved. See [ZOE's architecture and verification guide](zoe/guiai-lab/docs/UNIFIED.md) and the [native hub screenshot](zoe/guiai-lab/docs/images/gem-unified-native.png).
+
 **Current version:** 0.6.0
 
 **Primary question:** **What did the agent do on the computer?**

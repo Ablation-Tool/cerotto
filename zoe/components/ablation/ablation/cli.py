@@ -1,0 +1,1823 @@
+"""
+ablation.cli: command-line interface.
+
+Usage:
+    ablation analyze  <binary>              binary summary: arch, PLT, exports, funcs
+    ablation search   <binary> <query>      semantic search across all functions
+    ablation taint    <binary>              taint trace from network sources to sinks (arch-aware)
+    ablation taint    <binary> --interprocedural      cross-function BFS taint chains
+    ablation taint    <binary> --flow-sensitive        CFG MFP + interprocedural (most precise)
+    ablation overflow <binary>              ARM32 integer overflow scan (MUL -> malloc without check)
+    ablation window   <binary> <va>         annotated disassembly window around a VA
+    ablation profile  <binary> <va>         full function profile: strings + call args + sinks
+    ablation cfg      <binary> <va>         control-flow graph for one function (hex VA)
+    ablation crypto   <binary>              entropy scan + XOR/AES key search
+    ablation corpus   <binary>              build or rebuild the semantic function corpus
+    ablation sweep    <binary>              run all registered patterns against a binary
+    ablation findings                       list confirmed findings in ~/.ablation/findings.db
+    ablation driver   <binary.sys>          Windows kernel driver: IOCTL, callbacks, dangerous patterns
+    ablation byovd    <binary.sys>          BYOVD risk score: signed driver + IOCTL surface + dangerous primitive
+    ablation fmtstr   <binary>              format string scan: printf/syslog with non-literal format arg
+    ablation news                           show recent updates
+
+claude.ai workflow (no Claude Code access):
+    Run any command above, copy the output, paste into claude.ai.
+    ablation analyze  gives the full binary context block to start a session.
+    ablation window   gives disassembly you can ask claude.ai to annotate.
+    ablation taint    gives source-to-sink findings to ask about.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_DEFAULT_DB = Path('~/.ablation/func_id.db').expanduser()
+
+
+def _require_binary(path: str) -> Path:
+    p = Path(path)
+    if not p.exists():
+        print(f"error: file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    return p
+
+
+def _build_corpus_for(binary_path: str, db: Path) -> None:
+    """Ensure func_id.db contains an up-to-date corpus entry for binary_path."""
+    from ablation.analyzers.corpus_builder import CorpusBuilder
+    product = Path(binary_path).stem
+    cb = CorpusBuilder(db_path=str(db))
+    cb.build(binary_path, product=product, version='unknown', progress=False)
+
+
+def cmd_analyze(args):
+    from ablation.analyzers.binary_context import BinaryContext
+    from ablation.analyzers.entropy_mapper import EntropyMapper
+
+    ctx = BinaryContext.load_or_build(str(_require_binary(args.binary)))
+    print(ctx.summary())
+    if ctx.arch in ('mips32', 'mips64'):
+        from ablation.analyzers.mips_elf import describe_mips_elf
+        print(f"  ISA/ABI    : {describe_mips_elf(args.binary)}")
+
+    if args.entropy:
+        result = EntropyMapper(str(args.binary)).run()
+        print(f"\nEntropy regions ({len(result.regions)} found):")
+        for region in result.regions[:20]:
+            print(f"  {region.fmt()}")
+
+
+def cmd_search(args):
+    from ablation.analyzers.semantic_search import SemanticSearcher
+
+    p = str(_require_binary(args.binary))
+    db = Path(args.db).expanduser()
+
+    print(f"Building corpus for {Path(p).name} ...")
+    _build_corpus_for(p, db)
+
+    searcher = SemanticSearcher(str(db))
+    n = searcher.build_corpus()
+    print(f"Corpus: {n} functions. Querying ...")
+
+    results = searcher.query(args.query, top_k=args.top_k)
+    if not results:
+        print("No results.")
+        return
+
+    print(f"\nTop {len(results)} matches for: {args.query!r}\n")
+    for r in results:
+        name = r.name or hex(r.va)
+        print(f"  0x{r.va:x}  {name:<50s}  score={r.score:.3f}")
+
+
+def _elf_endian(path: str, default: str = 'little') -> str:
+    try:
+        with open(path, 'rb') as handle:
+            header = handle.read(6)
+    except OSError:
+        return default
+    if header[:4] != b'\x7fELF' or len(header) < 6:
+        return default
+    if header[5] == 1:
+        return 'little'
+    if header[5] == 2:
+        return 'big'
+    return default
+
+
+def cmd_taint(args):
+    from ablation.analyzers.binary_context import BinaryContext
+
+    p = str(_require_binary(args.binary))
+    ctx = BinaryContext.load_or_build(p)
+    arch = ctx.arch
+
+    if getattr(args, 'flow_sensitive', False) and arch != 'x86_64':
+        raise SystemExit(f"--flow-sensitive is supported only for x86-64, not {arch}")
+
+    if arch == 'arm32':
+        from ablation.analyzers.taint_tracker_arm32 import ARM32TaintTracker
+        tracker = ARM32TaintTracker.from_context(ctx)
+        findings = tracker.run_interprocedural()
+        if not findings:
+            print("No taint paths found.")
+            return
+        print(tracker.report(findings))
+        return
+
+    if arch == 'arm64':
+        from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+        tracker = ARM64TaintTracker.from_context(ctx)
+        if getattr(args, 'interprocedural', False):
+            findings = tracker.run_interprocedural(depth=getattr(args, 'depth', 4))
+        else:
+            findings = tracker.run()
+        if not findings:
+            print("No taint paths found.")
+            return
+        print(tracker.report(findings))
+        return
+
+    if arch == 'x86_32':
+        from ablation.analyzers.taint_tracker_x86_32 import X86_32TaintTracker
+        tracker = X86_32TaintTracker.from_path(p)
+        findings = tracker.run_interprocedural()
+        if not findings:
+            print("No taint paths found.")
+            return
+        for finding in findings:
+            print(finding)
+        return
+
+    delegated = {
+        'mips32': cmd_mips,
+        'mips64': cmd_mips64,
+        'ppc32': cmd_ppc32,
+        'ppc64': cmd_ppc64,
+        'riscv32': cmd_riscv32,
+        'riscv64': cmd_riscv64,
+        'loongarch64': cmd_loongarch64,
+        'arc': cmd_arc,
+    }
+    if arch in delegated:
+        endian = _elf_endian(p)
+        defaults = {
+            'json': None,
+            'full': False,
+            'le': endian == 'little',
+            'be': endian == 'big',
+        }
+        for name, value in defaults.items():
+            if not hasattr(args, name):
+                setattr(args, name, value)
+        return delegated[arch](args)
+
+    if arch != 'x86_64':
+        raise SystemExit(f"Taint analysis is not supported for architecture: {arch}")
+
+    from ablation.analyzers.xref_graph import XRefGraph
+    from ablation.analyzers.taint_tracker_x86 import TaintTracker
+    xg = XRefGraph.from_path(p)
+    xg.build()
+    tracker = TaintTracker(p, xref=xg)
+
+    if getattr(args, 'flow_sensitive', False):
+        print("[*] Running flow-sensitive CFG taint analysis (MFP + interprocedural BFS) ...")
+        findings, chains = tracker.run_flow_sensitive()
+        if not findings and not chains:
+            print("No taint paths found.")
+            return
+        if findings:
+            print(f"{len(findings)} intraprocedural finding(s):\n")
+            for f in findings:
+                print(f)
+        if chains:
+            print(f"\n{len(chains)} interprocedural chain(s):\n")
+            for c in chains:
+                print(c)
+    elif getattr(args, 'interprocedural', False):
+        depth = getattr(args, 'depth', 4)
+        print(f"[*] Running interprocedural taint analysis (depth={depth}) ...")
+        chains = tracker.run_interprocedural(depth=depth)
+        if not chains:
+            print("No taint paths found.")
+            return
+        print(f"{len(chains)} interprocedural chain(s):\n")
+        for c in chains:
+            print(c)
+    else:
+        findings = tracker.run()
+        if not findings:
+            print("No taint paths found.")
+            return
+        print(f"{len(findings)} taint finding(s):\n")
+        for f in findings:
+            print(f)
+
+
+def cmd_overflow(args):
+    """ARM32 integer overflow scan: MUL/UMULL with wire-controlled operands before allocation."""
+    from ablation.analyzers.binary_context import BinaryContext
+
+    p = str(_require_binary(args.binary))
+    ctx = BinaryContext.load_or_build(p)
+
+    if ctx.arch != 'arm32':
+        print(f"overflow scan is ARM32-only (binary arch: {ctx.arch})")
+        return
+
+    from ablation.analyzers.intoverflow_scanner_arm32 import ARM32IntOverflowScanner
+    scanner = ARM32IntOverflowScanner.from_context(ctx)
+    findings = scanner.scan()
+    print(scanner.report(findings))
+
+
+def cmd_window(args):
+    """Annotated disassembly window around a VA: suitable for pasting into claude.ai."""
+    from ablation.analyzers.window_analyzer import WindowAnalyzer
+
+    p = str(_require_binary(args.binary))
+    va = int(args.va, 16)
+    back = args.back
+    window = args.window
+
+    wa = WindowAnalyzer.from_path(p)
+    text = wa.dump_text(va=va, window=window, align_back=back, header=True)
+    print(text)
+
+    if args.calls:
+        calls = wa.calls_in_window(va=va, window=window, align_back=back)
+        if calls:
+            print(f"\nCall sites ({len(calls)}):")
+            for site, target, label in calls:
+                tag = f"  -> {label}" if label else ""
+                print(f"  0x{site:x}  ->  0x{target:x}{tag}")
+
+    if args.funcs:
+        starts = wa.find_func_starts(va=va, window=window, align_back=back)
+        if starts:
+            print(f"\nFunction starts ({len(starts)}):")
+            for s in starts:
+                print(f"  0x{s:x}")
+
+
+def cmd_profile(args):
+    """Full function profile: strings + call site args + sink flags."""
+    from ablation.analyzers.binary_context import BinaryContext
+    from ablation.analyzers.func_profiler import FuncProfiler
+
+    p = str(_require_binary(args.binary))
+    va = int(args.va, 16)
+    ctx = BinaryContext.load_or_build(p)
+
+    fp = FuncProfiler.from_context(ctx)
+    profile = fp.profile(va=va)
+    print(profile.fmt())
+
+    if profile.sink_calls:
+        print(f"\nSink calls ({len(profile.sink_calls)}):")
+        for sc in profile.sink_calls:
+            print(f"  0x{sc.va:x}  {sc.target_name}  [SINK]")
+
+
+def cmd_cfg(args):
+    from ablation.analyzers.cfg_builder import CFGBuilder
+
+    p = str(_require_binary(args.binary))
+    va = int(args.va, 16)
+
+    builder = CFGBuilder(p)
+    cfg = builder.build_function(va)
+
+    s = cfg.stats()
+    print(f"CFG for 0x{va:x}: {s['blocks']} blocks, {s['edges']} edges, {s['instructions']} instructions\n")
+    for bb_va, bb in sorted(cfg.blocks.items()):
+        succs = ', '.join(f'0x{s:x}' for s in bb.succs)
+        print(f"  0x{bb_va:x}..0x{bb.end:x}  succs=[{succs}]")
+        if args.insns:
+            for insn_va, mnem, ops in bb.insns:
+                print(f"    0x{insn_va:x}  {mnem} {ops}")
+
+
+def cmd_crypto(args):
+    from ablation.core.firmware_analyzer import scan_firmware_file
+    from ablation.core.render import (
+        RED, ORANGE, YELLOW, GREEN, GRAY, BOLD, DIM, RESET,
+        box, sbox, section,
+    )
+
+    p = str(_require_binary(args.binary))
+    result = scan_firmware_file(p)
+
+    _SEV_COLOR = {'CRITICAL': RED, 'HIGH': RED, 'MEDIUM': ORANGE, 'LOW': YELLOW}
+
+    print(box([
+        BOLD + f"crypto  {result['filepath']}" + RESET,
+        DIM + (f"size: {result['size']:,} bytes  "
+               f"entropy sections: {len(result['entropy_sections'])}  "
+               f"signatures: {len(result['signatures'])}") + RESET,
+    ]))
+    print()
+
+    findings = result['findings']
+    if findings:
+        print(section('FINDINGS', RED))
+        print()
+        for f in findings:
+            c = _SEV_COLOR.get(f['severity'], GRAY)
+            print(sbox([
+                c + f"[{f['severity']}]  {f['category']}" + RESET,
+                DIM + str(f['detail']) + RESET,
+            ], c))
+            print()
+    else:
+        print(GREEN + 'No findings.' + RESET)
+        print()
+
+    if result['entropy_sections']:
+        print(section('ENTROPY TRANSITIONS', GRAY))
+        print()
+        _ETYPE_COLOR = {'encrypted': RED, 'compressed': YELLOW}
+        for sec in result['entropy_sections']:
+            ec = _ETYPE_COLOR.get(sec['type'], GRAY)
+            print(f"  {ec}{sec['type']:<14}{RESET}"
+                  f"  {DIM}offset 0x{sec['offset']:08x}  "
+                  f"entropy {sec['entropy']:.2f}{RESET}")
+        print()
+
+
+def cmd_corpus(args):
+    from ablation.analyzers.corpus_builder import CorpusBuilder
+
+    p = str(_require_binary(args.binary))
+    db = Path(args.db).expanduser()
+    product = args.product or Path(p).stem
+    version = args.version or 'unknown'
+
+    cb = CorpusBuilder(db_path=str(db))
+    n = cb.build(p, product=product, version=version, progress=True)
+    print(f"\nCorpus built: {n} functions indexed")
+    print(f"DB: {db}")
+
+    if args.sigs:
+        from ablation.analyzers.sig_library import SigLibrary
+        print("\nRunning signature matching on unnamed functions ...")
+        lib = SigLibrary()
+        renamed = lib.auto_name(str(db), dry_run=False)
+        if renamed:
+            print(f"Renamed {renamed} fn_0x* functions via signature matching")
+        else:
+            print("No unnamed functions matched known signatures")
+
+
+def cmd_sweep(args):
+    import json as _json
+    from ablation.analyzers.semantic_search import SemanticSearcher
+    from ablation.analyzers.pattern_library import PatternLibrary
+
+    p = str(_require_binary(args.binary))
+    db = Path(args.db).expanduser()
+
+    print(f"Building corpus for {Path(p).name} ...")
+    _build_corpus_for(p, db)
+
+    searcher = SemanticSearcher(str(db))
+    n = searcher.build_corpus()
+    print(f"Corpus: {n} functions. Running pattern sweep ...")
+
+    pl = PatternLibrary()
+    results = pl.sweep(searcher, top_k=args.top_k, min_score=args.min_score)
+
+    if args.sarif:
+        from ablation.export.sarif import sweep_to_sarif
+        doc = sweep_to_sarif(results, binary_path=p, min_score=args.min_score)
+        Path(args.sarif).write_text(_json.dumps(doc, indent=2))
+        print(f"SARIF written to {args.sarif}")
+    elif args.json:
+        from ablation.export.json_export import sweep_to_json
+        doc = sweep_to_json(results, binary_path=p, min_score=args.min_score)
+        Path(args.json).write_text(_json.dumps(doc, indent=2))
+        print(f"JSON written to {args.json}")
+    else:
+        print(pl.fmt_sweep(results, binary_name=Path(p).name))
+
+
+def cmd_findings(args):
+    import json as _json
+    from ablation.analyzers.finding_registry import FindingRegistry
+
+    reg = FindingRegistry()
+    findings = reg.list_findings()
+
+    if not findings:
+        print("No confirmed findings recorded.")
+        return
+
+    if args.sarif:
+        from ablation.export.sarif import findings_to_sarif
+        doc = findings_to_sarif(findings)
+        Path(args.sarif).write_text(_json.dumps(doc, indent=2))
+        print(f"SARIF written to {args.sarif}")
+        return
+
+    if args.json:
+        from ablation.export.json_export import findings_to_json
+        doc = findings_to_json(findings)
+        Path(args.json).write_text(_json.dumps(doc, indent=2))
+        print(f"JSON written to {args.json}")
+        return
+
+    print(f"{len(findings)} finding(s):\n")
+    for f in findings:
+        print(f"  [{f.get('severity','?')}] {f.get('product','')}  {f.get('title','')}")
+
+
+def cmd_driver(args):
+    from ablation.analyzers.kernel_driver_analyzer import KernelDriverAnalyzer
+    import json as _json2
+
+    p = _require_binary(args.binary)
+    kda = KernelDriverAnalyzer.from_path(str(p))
+    report = kda.analyze()
+
+    if report.error:
+        print(f"error: {report.error}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        Path(args.json).write_text(_json2.dumps(report.summary(), indent=2))
+        print(f"JSON written to {args.json}")
+        return
+
+    print(report.fmt())
+
+
+def cmd_byovd(args):
+    from ablation.analyzers.byovd_detector import BYOVDDetector
+    import json as _json3
+
+    p = _require_binary(args.binary)
+    det = BYOVDDetector.from_path(str(p))
+    report = det.analyze()
+
+    if args.json:
+        Path(args.json).write_text(_json3.dumps(report.summary(), indent=2))
+        print(f"JSON written to {args.json}")
+        return
+
+    print(report.fmt())
+
+
+_RECENT_UPDATES = """\
+v3.4.0 (2026-09-30)  LoongArch64 taint tracker + decoder
+  ablation loongarch64       <binary> [--interprocedural] [--depth N] [--full] [--json FILE]
+  ablation loongarch64-decode <binary> [--base N] [--frames] [--limit N] [--json FILE]
+  - LoongArch64TaintTracker: lp64 ABI; $a0-$a7 args, $ra caller-saved
+  - Sources: recv/recvfrom/read/fgets (libc) + copy_from_user/nla_get_string (kernel)
+  - Sinks: system/execve/strcpy/memcpy (libc) + copy_to_user/call_usermodehelper (kernel)
+  - Escalation (CRITICAL): commit_creds, prepare_kernel_cred
+  - Syscall tracking: $a7 const-folding -> 318-entry asm-generic table; source/sink/escalation
+  - Exception paths: ertn (no successors), break/dbcl (trap)
+  - from_path_full(): .eh_frame FDE + DWARF subprogram + BTF func_info
+  - PLT resolution: R_LARCH_JUMP_SLOT -> exact plt_va -> sym_name (no ±16 scan)
+  - Targets: TencentOS 4.6 server packages, Loongson 3A5000/3C5000, kernel modules
+
+v3.3.0 (2026-09-30)  nanoMIPS taint tracker
+  ablation nanomips-taint <binary> [--le] [--interprocedural] [--depth N] [--json FILE]
+  - NanoMIPSTaintTracker: O32-compatible ABI; $a0-$a3 args, $v0 return,
+    $t0-$t9 caller-saved; no branch delay slots
+  - Sources: recv/recvfrom/read/fgets/gets/fread (return value in $v0)
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/snprintf/memcpy/strcat/bcopy
+  - Two paths: capstone 6.x full decode (register-level) or conservative fallback
+    (frame-walk BALC target extraction + conservative $a0-$a3 taint after source call)
+  - BALC target decode: P32 bits[31:26]=0x2a, 26-bit signed offset; P16 bits[15:10]=0b110010, 10-bit
+  - Return: JRC $ra (no delay slot); Call: BALC (P16/P32), JALRC (P32)
+  - PLT stub size: 12 bytes (3 × P32 insns); prologue: ADDIU $sp, $sp, -N
+  - Targets: Ingenic X-series (JZ4780, X1000, X2000), MediaTek Helio embedded,
+    MIPS32r6 microcontrollers
+
+v3.2.0 (2026-09-24)  Renesas V850 taint tracker + frame decoder
+  ablation v850       <binary> [--be] [--interprocedural] [--depth N] [--json FILE]
+  ablation v850-decode <binary> [--be] [--base N] [--frames] [--limit N] [--json FILE]
+  - V850TaintTracker: V850 EABI ABI; r6-r9 args (4 regs only), r10 return,
+    r20-r29 callee-saved; pure-Python (no capstone V850)
+  - Sources: recv/recvfrom/read/fgets/gets/fread (return value in r10)
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/snprintf/memcpy/strcat
+  - V850Decoder: mixed 16/32-bit frame walker; width discriminant: op6>=0x20 -> 32-bit
+  - JARL disp22, lp: direct call; JMP [lp]: return
+  - JARL target: sign_extend_22({hw1[15:0], hw0[15:11]<<1})
+  - Prologue scan: PREPARE instruction (GCC V850 EABI function entry marker)
+  - Default little-endian (V850ES/SJ3 GCC); --be for big-endian variants
+  - DisasmEngine: arch='v850' routes through V850Decoder (_v850_stream)
+  - Targets: Renesas RH850/G3M + G3MH (automotive ECU, AUTOSAR), V850E2R (industrial),
+    V850E3V5 (dual-core ASIL-D), NEC V850ES/SJ3 (power systems, white goods)
+
+v3.1.0 (2026-09-24)  RISC-V 64-bit taint tracker
+  ablation riscv64    <binary> [--interprocedural] [--depth N] [--json FILE]
+  - RISCV64TaintTracker: RISC-V Linux lp64 ABI; a0-a7 args (8 regs), a0 return,
+    s0-s11 callee-saved; capstone CS_ARCH_RISCV + CS_MODE_RISCV64 + CS_MODE_RISCVC
+  - RV64-specific ops: ld/sd, addiw, addw/subw/mulw/divw/remw, sllw/srlw/sraw,
+    c.ld/c.ldsp/c.addiw/c.addw/c.subw
+  - Call/ret detection identical to RV32: jal/jalr/ret/c.jr ra
+  - Targets: VisionFive 2, SiFive Unmatched, Milk-V Pioneer, SpacemiT K1,
+    SOPHON BM1684, OpenWrt RISC-V 64, PLCT RISC-V Linux servers
+
+v3.0.0 (2026-09-24)  RISC-V 32-bit taint tracker
+  ablation riscv32    <binary> [--interprocedural] [--depth N] [--json FILE]
+  - RISCV32TaintTracker: RISC-V Linux ilp32 ABI; a0-a7 args (8 regs), a0 return,
+    s0-s11 callee-saved; no delay slots; capstone CS_ARCH_RISCV + CS_MODE_RISCV32 + CS_MODE_RISCVC
+  - Sources: recv/recvfrom/read/fgets/gets/fread (return value in a0)
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/snprintf/memcpy/strcat
+  - Call detection: jal (direct, PC-rel 21-bit), jalr (indirect), c.jal/c.jalr (RVC)
+  - Return detection: ret (= jalr zero, 0(ra)), c.jr ra, jr ra
+  - Prologue scan: addi sp, sp, -N (or c.addi16sp for RVC); function-start heuristic
+  - DisasmEngine: arch='riscv'/'riscv32' + CS_MODE_RISCVC (compressed always on)
+  - Targets: SiFive/StarFive Linux SoCs, Allwinner D1, ESP32-C3, GD32VF103, VisionFive 2,
+    Milk-V Duo, Kendryte K210, OpenWrt RISC-V, Sipeed Maix
+
+v2.9.0 (2026-09-25)  Synopsys DesignWare ARC taint tracker + frame decoder
+  ablation arc        <binary> [--be] [--interprocedural] [--depth N] [--json FILE]
+  ablation arc-decode <binary> [--be] [--base N] [--frames] [--limit N] [--json FILE]
+  - ARCTaintTracker: ARC Linux ABI; r0-r7 args (8 regs), r0 return,
+    r13-r25 callee-saved; no delay slots; pure-Python (no capstone ARC)
+  - Sources: recv/recvfrom/read/fgets/gets/fread (return value in r0)
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/snprintf/memcpy/strcat
+  - ARCDecoder: mixed 16/32-bit frame walker; discriminant: (hw0>>11)&0x1f >= 0x18 -> 16-bit
+  - BL detection: (hw0 & 0xFE00) == 0x2200 (op5=4, unconditional, link bit set)
+  - J[blink] return: (hw0 & 0xFE00)==0x3800 + (hw1 & 0x003F)==0x001F
+  - Prologue scan: push_s blink (compact 16-bit) or op5=0x18 heuristic
+  - Default little-endian (Linux ARC HS); --be for ARC 600/700 big-endian targets
+  - DisasmEngine: arch='arc'/'arc32' routes through ARCDecoder (_arc_stream)
+  - Targets: ARC EM/HS (IoT MCU, smart TV, storage), ARC 770D, automotive SoCs
+
+v2.8.0 (2026-09-24)  PowerPC 64-bit taint tracker
+  ablation ppc64   <binary> [--le] [--interprocedural] [--depth N] [--json FILE]
+  - PPC64TaintTracker: ELFv2 (OpenPOWER Linux) and ELFv1 (AIX/old Linux PPC64)
+    ABI; r3-r10 args (8 regs), r3 return, r14-r31 callee-saved; no delay slots
+  - Sources: recv/recvfrom/read/fgets/gets/fread (return value in r3)
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/snprintf/memcpy/strcat
+  - 64-bit ops: LD/STD/STDU/MULLD/DIVD/DIVDU/SLD/SRD/RLDICL/RLDICR/EXTSW
+  - Prologue scan: stdu r1, -N(r1) for function-start discovery without symbols
+  - Interprocedural BFS: follows tainted args r3-r10 through direct bl callees
+  - Big-endian (IBM POWER/AIX, old OpenPOWER, Apple G5, Juniper MX/PTX)
+  - Little-endian: POWER8+ OpenPOWER Linux
+  - DisasmEngine: ppc64 arch stdu prologue detection added
+
+v2.7.0 (2026-09-24)  PowerPC 32-bit taint tracker
+  ablation ppc32   <binary> [--le] [--interprocedural] [--depth N] [--json FILE]
+  - PPC32TaintTracker: System V / EABI ABI; r3-r10 args (8 regs), r3 return,
+    r13-r31 callee-saved; no branch delay slots
+  - Sources: recv/recvfrom/read/fgets/gets/fread (return value in r3)
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/snprintf/memcpy/strcat
+  - Call detection: bl (direct), bctrl (indirect via CTR for PLT stubs)
+  - Return detection: blr/blrl
+  - Prologue scan: stwu r1, -N(r1) for function-start discovery without symbols
+  - Interprocedural BFS: follows tainted args r3-r10 through direct bl callees
+  - Big-endian (Cisco IOS 7200/3700, MikroTik RB600, VxWorks)
+  - Little-endian: POWER LE Linux userspace
+  - DisasmEngine: arch='ppc'/'ppc32'/'ppc64' + endian kwarg;
+    _is_prologue stwu detection; stream() PPC branch/call/ret classification
+
+v2.6.0 (2026-09-24)  MIPS 32+nM and MIPS 64 support
+  ablation mips64   <binary> [--le] [--json FILE]
+  ablation nanomips <binary> [--le] [--json FILE]
+  - MIPS64TaintTracker: N64 ABI; 8 arg regs ($a0-$a3 + $t0-$t3 for $8-$11);
+    64-bit ops LD/SD/DADDU/DADDIU/DMULT; delay-slot aware; interprocedural BFS
+    big-endian (Cisco IOS/OCTEON) and little-endian (RouterOS 64)
+  - NanoMIPSDecoder: variable-length frame walker P16/P32/P48 (16/32/48-bit);
+    full decode with capstone 6.x; branch-hint fallback on capstone 5.x;
+    function-start prologue heuristic; Ingenic SoC and MediaTek embedded
+  - DisasmEngine: arch='mips32'/'mips64'/'mips32r6'/'nanomips' + endian kwarg;
+    MIPS prologue detection (addiu/daddiu $sp,$sp,-N); MIPS stream() classification
+
+v2.5.0 (2026-09-24)  HeapUAFScanner, MIPS32FuncProfiler, ByovdDetector aliases
+
+v2.4.0 (2026-09-24)  MIPS32 taint tracker + cross-binary taint + IOCTL surface
+  ablation mips <binary> [--le]
+  ablation ioctl-surface <driver.sys>
+  - MIPS32TaintTracker: O32 ABI; $a0-$a3 args, $v0 return; caller/callee-saved model
+  - Sources: recv/recvfrom/read/fgets/gets/fread
+  - Sinks: system/execve/execl/execvp/popen/strcpy/sprintf/memcpy/strcat/snprintf
+  - Load-delay slot aware (delay slot instruction executes before branch takes effect)
+  - Big-endian (RouterOS, Broadcom) and little-endian (embedded CPE) support
+  - Intraprocedural + interprocedural BFS up to depth 4
+  - CrossBinaryTaintTracker: follows taint across library boundaries via LibGraph;
+    seeds tainted return values at each export crossing
+  - IoctlAttackSurface: per-IOCTL handler attack surface report; pairs CTL_CODE
+    decode with METHOD_NEITHER flag and handler disassembly window
+
+v2.3.0 (2026-09-24)  Heap vulnerability scanner
+  ablation heap <binary>
+  - INT_OVERFLOW_BEFORE_ALLOC: IMUL/MUL/SHL result to malloc without overflow check
+    (TAOSSA Ch6 L6-2 width*height pattern, L6-3 nresp*sizeof pattern)
+  - USE_AFTER_FREE: free(ptr) then dereference of same register in same function
+  - DOUBLE_FREE: same register freed twice without intervening reassignment
+  - OFF_BY_ONE_ALLOC: strlen result to malloc without +1 for NUL terminator
+
+v2.2.0 (2026-09-24)  BYOVD detector
+  ablation byovd <file.sys>
+  - Wraps KernelDriverAnalyzer with BYOVD-specific scoring (0-100)
+  - 8 attack paths: PHYS_MEM_ARBITRARY_RW, MDL_KERNEL_WRITE,
+    MSR_LSTAR_MANIPULATION, SSDT_HOOK, TOKEN_STEALING_LPE, SMEP_BYPASS,
+    APC_KERNEL_INJECTION, VIRTUAL_MEM_WRITE
+  - Signed driver + METHOD_NEITHER IOCTL + dangerous primitive = BYOVD_CONFIRMED
+  - Grounded in PRE ch3 IRP walk-through: MmMapIoSpace, MapMdl sequence,
+    KeServiceDescriptorTable SSDT hook, MSR_LSTAR read/write
+
+v2.1.0 (2026-09-24)  Format string vulnerability scanner
+  ablation fmtstr <binary>
+  - Scans x86-64 ELF for printf/fprintf/syslog/err/warn family calls
+    where the format argument is not a string literal
+  - 28 format string sinks: printf, fprintf, sprintf, snprintf, syslog,
+    err, errx, warn, warnx, wprintf, fwprintf, vsnprintf, and variants
+  - Static backward trace from each call site: LEA [rip+offset] into
+    .rodata = SAFE; MOV from stack slot or arg register = VULNERABLE
+  - Two-hop detection: vsnprintf output buffer reused as syslog format arg
+  - Verdicts: VULNERABLE / SUSPICIOUS / SAFE with write instruction context
+
+v2.0.0 (2026-09-24)  Windows kernel driver RE
+  ablation driver <file.sys>
+  - IRP/IOCTL dispatch extraction (capstone DriverEntry disassembly)
+  - CTL_CODE decoder; METHOD_NEITHER (raw user pointer) flagged
+  - 40+ kernel API risk classifications across 12 classes
+  - 20+ callback registrations (edr_like / rootkit_risk / info)
+  - Pool tag extraction from MOV R8D byte pattern
+  - Dangerous patterns: CR0/CR4 sequences, MSR_LSTAR read/write,
+    L"KeServiceDescriptorTable" wide-string scan, RDMSR/WRMSR,
+    CLI/STI/HLT, SWAPGS, IRETQ, I/O ports
+  - WDM / KMDF / minifilter classification; PDB path; Authenticode
+
+v1.9.1 (2026-09-24)  see CHANGELOG.md for earlier entries
+"""
+
+
+def cmd_fmtstr(args):
+    from ablation.analyzers.format_string_scanner import FormatStringScanner
+
+    p = str(_require_binary(args.binary))
+    scanner = FormatStringScanner.from_path(p)
+    findings = scanner.scan()
+
+    if args.json:
+        import json
+        out = [f.as_dict() for f in findings if f.verdict != 'SAFE']
+        with open(args.json, 'w') as fh:
+            json.dump(out, fh, indent=2)
+        print(f"Wrote {len(out)} findings to {args.json}")
+    else:
+        non_safe = [f for f in findings if f.verdict != 'SAFE']
+        print(scanner.report(non_safe))
+
+
+def cmd_heap(args):
+    from ablation.analyzers.heap_vuln_scanner import HeapVulnScanner
+
+    p = str(_require_binary(args.binary))
+    scanner = HeapVulnScanner.from_path(p)
+    findings = scanner.scan()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'kind': f.kind, 'func_va': hex(f.func_va), 'site_va': hex(f.site_va),
+                'severity': f.severity, 'description': f.description,
+                'alloc_sym': f.alloc_sym, 'freed_at': hex(f.freed_at) if f.freed_at else '',
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(scanner.report(findings))
+
+
+def cmd_mips(args):
+    from ablation.analyzers.taint_tracker_mips import MIPS32TaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'little' if args.le else 'big'
+    tracker = MIPS32TaintTracker.from_path(p, endian=endian)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'sink_va': hex(f.sink_va),
+                'sink_name': f.sink_name, 'tainted_args': f.tainted_args,
+                'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_mips64(args):
+    from ablation.analyzers.taint_tracker_mips64 import MIPS64TaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'little' if args.le else 'big'
+    tracker = MIPS64TaintTracker.from_path(p, endian=endian)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_nanomips(args):
+    from ablation.analyzers.nanomips_decoder import NanoMIPSDisasm
+
+    binary_path = _require_binary(args.binary)
+    data = binary_path.read_bytes()
+    endian = 'little' if args.le else 'big'
+    dis = NanoMIPSDisasm(endian=endian)
+
+    if args.frames:
+        print(dis.report_frames(data, base_addr=args.base, limit=args.limit))
+        return
+
+    starts = dis.find_function_starts(data, base_addr=args.base)
+    if args.json:
+        import json
+        out = [{'func_va': hex(va)} for va in starts]
+        Path(args.json).write_text(json.dumps(out, indent=2))
+        print(f"Wrote {len(out)} function starts to {args.json}")
+    else:
+        print(f"nanoMIPS function starts ({len(starts)} found, base={hex(args.base)}):")
+        for va in starts:
+            print(f"  {hex(va)}")
+        if not dis.has_full_decode:
+            print("\nNote: install capstone 6.x for full nanoMIPS decode.")
+
+
+def cmd_nanomips_taint(args):
+    from ablation.analyzers.taint_tracker_nanomips import NanoMIPSTaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'little' if args.le else 'big'
+    tracker = NanoMIPSTaintTracker.from_path(p, endian=endian)
+
+    if not tracker.has_full_decode:
+        print("Note: capstone 6.x not available; using conservative fallback decode.")
+        print("      Install capstone 6.x for register-level precision.\n")
+
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va) if hasattr(f, 'func_va') else hex(f.func_chain[0]),
+                'sink_va': hex(f.sink_va),
+                'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args,
+                'source': f.source_name,
+                'full_decode': f.full_decode,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_arc(args):
+    from ablation.analyzers.taint_tracker_arc import ARCTaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'big' if args.be else 'little'
+    tracker = ARCTaintTracker.from_path(p, endian=endian)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_arc_decode(args):
+    from ablation.analyzers.arc_decoder import ARCDisasm
+
+    binary_path = _require_binary(args.binary)
+    data = binary_path.read_bytes()
+    endian = 'big' if args.be else 'little'
+    dis = ARCDisasm(endian=endian)
+
+    if args.frames:
+        print(dis.report_frames(data, base_addr=args.base, limit=args.limit))
+        return
+
+    starts = dis.find_function_starts(data, base_addr=args.base)
+    if args.json:
+        import json
+        out = [{'func_va': hex(va)} for va in starts]
+        Path(args.json).write_text(json.dumps(out, indent=2))
+        print(f"Wrote {len(out)} function starts to {args.json}")
+    else:
+        print(f"ARC function starts ({len(starts)} found, base={hex(args.base)}):")
+        for va in starts:
+            print(f"  {hex(va)}")
+
+
+def cmd_riscv64(args):
+    from ablation.analyzers.taint_tracker_riscv64 import RISCV64TaintTracker
+
+    p = str(_require_binary(args.binary))
+    tracker = RISCV64TaintTracker.from_path(p)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_riscv32(args):
+    from ablation.analyzers.taint_tracker_riscv32 import RISCV32TaintTracker
+
+    p = str(_require_binary(args.binary))
+    tracker = RISCV32TaintTracker.from_path(p)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_ppc64(args):
+    from ablation.analyzers.taint_tracker_ppc64 import PPC64TaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'little' if args.le else 'big'
+    tracker = PPC64TaintTracker.from_path(p, endian=endian)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_ppc32(args):
+    from ablation.analyzers.taint_tracker_ppc32 import PPC32TaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'little' if args.le else 'big'
+    tracker = PPC32TaintTracker.from_path(p, endian=endian)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_v850(args):
+    from ablation.analyzers.taint_tracker_v850 import V850TaintTracker
+
+    p = str(_require_binary(args.binary))
+    endian = 'big' if args.be else 'little'
+    tracker = V850TaintTracker.from_path(p)
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va': hex(f.func_va), 'func_name': f.func_name,
+                'sink_va': hex(f.sink_va), 'sink_name': f.sink_name,
+                'tainted_args': f.tainted_args, 'source': f.source_name,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_v850_decode(args):
+    from ablation.analyzers.v850_decoder import V850Disasm
+
+    binary_path = _require_binary(args.binary)
+    data = binary_path.read_bytes()
+    endian = 'big' if args.be else 'little'
+    dis = V850Disasm(endian=endian)
+
+    if args.frames:
+        print(dis.report_frames(data, base_addr=args.base, limit=args.limit))
+        return
+
+    starts = dis.find_function_starts(data, base_addr=args.base)
+    if args.json:
+        import json
+        out = [{'func_va': hex(va)} for va in starts]
+        Path(args.json).write_text(json.dumps(out, indent=2))
+        print(f"Wrote {len(out)} function starts to {args.json}")
+    else:
+        print(f"V850 function starts ({len(starts)} found, base={hex(args.base)}):")
+        for va in starts:
+            print(f"  {hex(va)}")
+
+
+def cmd_loongarch64(args):
+    from ablation.analyzers.taint_tracker_loongarch64 import LoongArch64TaintTracker
+
+    p = str(_require_binary(args.binary))
+    if args.full:
+        tracker = LoongArch64TaintTracker.from_path_full(p)
+    else:
+        tracker = LoongArch64TaintTracker.from_path(p)
+
+    if args.interprocedural:
+        findings = tracker.run_interprocedural(depth=args.depth)
+    else:
+        findings = tracker.run()
+
+    if args.json:
+        import json
+        data = [
+            {
+                'func_va':     hex(f.func_va),
+                'func_name':   f.func_name,
+                'sink_va':     hex(f.sink_va),
+                'sink_name':   f.sink_name,
+                'tainted_args': f.tainted_args,
+                'source':      f.source_name,
+                'severity':    f.severity,
+            }
+            for f in findings
+        ]
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(data)} findings to {args.json}")
+    else:
+        print(tracker.report(findings))
+
+
+def cmd_loongarch64_decode(args):
+    from ablation.analyzers.loongarch_decoder import LoongArchDecoder
+
+    binary_path = _require_binary(args.binary)
+    data        = binary_path.read_bytes()
+    dec         = LoongArchDecoder()
+
+    if args.frames:
+        frames = list(dec.decode_frames(data, base_addr=args.base))
+        if args.limit:
+            frames = frames[:args.limit]
+        if args.json:
+            import json
+            out = [
+                {
+                    'va': hex(f.va), 'mnemonic': f.mnemonic, 'op_str': f.op_str,
+                    'is_branch': f.is_branch, 'is_call': f.is_call,
+                    'is_ret': f.is_ret, 'target': hex(f.target) if f.target else None,
+                }
+                for f in frames
+            ]
+            Path(args.json).write_text(json.dumps(out, indent=2))
+            print(f"Wrote {len(out)} frames to {args.json}")
+        else:
+            for f in frames:
+                cf = ""
+                if f.is_call:   cf = " [call]"
+                elif f.is_ret:  cf = " [ret]"
+                elif f.is_branch: cf = f" [branch -> {f.target:#x}]" if f.target else " [branch]"
+                print(f"  {f.va:#010x}  {f.mnemonic:<16} {f.op_str}{cf}")
+        return
+
+    # Function start discovery: use prologue heuristic via the tracker
+    from ablation.analyzers.taint_tracker_loongarch64 import LoongArch64TaintTracker
+    tracker = LoongArch64TaintTracker(data, 0, args.base, args.base + len(data), {})
+    starts  = tracker._get_func_starts()
+    if args.json:
+        import json
+        out = [{'func_va': hex(va)} for va in starts]
+        Path(args.json).write_text(json.dumps(out, indent=2))
+        print(f"Wrote {len(out)} function starts to {args.json}")
+    else:
+        print(f"LoongArch64 function starts ({len(starts)} found, base={args.base:#x}):")
+        for va in starts:
+            print(f"  {va:#x}")
+
+
+def cmd_junos(args):
+    import json
+    from dataclasses import asdict
+
+    if args.junos_command == 'target':
+        from ablation.analyzers.junos_target import JunosTargetProfile
+        print(json.dumps(JunosTargetProfile.from_name().report(args.binary), indent=2))
+        return
+
+    if args.junos_command == 'xrefs':
+        from ablation.analyzers.binary_context import BinaryContext
+        from ablation.analyzers.mips_string_xrefs import resolve_string_xrefs
+        ctx = BinaryContext.load_or_build(args.binary)
+        targets = {va for va, value in ctx.strings.items() if args.substring in value}
+        if not targets:
+            raise SystemExit(f'error: no strings contain {args.substring!r}')
+        results = resolve_string_xrefs(args.binary, targets)
+        print(json.dumps([asdict(result) for result in results], indent=2))
+        return
+
+    if args.junos_command == 'overlay':
+        from ablation.analyzers.binary_context import BinaryContext
+        from ablation.analyzers.junos_overlay import recover_overlay
+        from ablation.analyzers.mips_string_xrefs import resolve_string_xrefs
+        ctx = BinaryContext.load_or_build(args.binary)
+        results = resolve_string_xrefs(args.binary, set(ctx.strings))
+        result = recover_overlay(ctx, results)
+        print(json.dumps(asdict(result), indent=2))
+        return
+
+    if args.junos_command == 'gencfg':
+        from ablation.analyzers.gencfg import load_schemas, serialize_vrf_group, validate_message
+        if args.list_schemas:
+            print(json.dumps(load_schemas(), indent=2))
+            return
+        if getattr(args, 'encode', False):
+            if args.family != 'vrf-group':
+                raise SystemExit('error: --encode currently supports only --family vrf-group')
+            try:
+                message = serialize_vrf_group(
+                    args.group_id, args.vrf or [], operation=args.operation, lsys_id=args.lsys_id,
+                )
+            except ValueError as exc:
+                raise SystemExit(f'error: {exc}') from exc
+            print(json.dumps({
+                'message': message.hex(),
+                'validation': validate_message(message, family=args.family),
+            }, indent=2))
+            return
+        if not args.message:
+            raise SystemExit('error: provide a hexadecimal message, --encode, or --list')
+        try:
+            message = bytes.fromhex(args.message)
+        except ValueError as exc:
+            raise SystemExit(f'error: invalid hexadecimal message: {exc}') from exc
+        print(json.dumps(validate_message(message, family=args.family), indent=2))
+        return
+
+    if args.junos_command == 'function-diff':
+        from ablation.analyzers.junos_function_diff import (
+            compare_functions, comparison_cache_key, write_json_atomic,
+        )
+        cache_path = None
+        if args.cache:
+            key = comparison_cache_key(
+                args.old, args.new, args.old_va, args.new_va, args.old_size, args.new_size,
+            )
+            cache_path = Path(args.cache, key + '.json')
+            if cache_path.is_file():
+                report = json.loads(cache_path.read_text())
+                report['cache_hit'] = True
+                print(json.dumps(report, indent=2))
+                return
+        try:
+            report = compare_functions(
+                args.old, args.new, args.old_va, args.new_va,
+                old_size=args.old_size, new_size=args.new_size,
+                max_size=args.max_size, timeout=args.timeout,
+            )
+        except (ValueError, TimeoutError) as exc:
+            raise SystemExit(f'error: {exc}') from exc
+        report['cache_hit'] = False
+        if cache_path:
+            write_json_atomic(cache_path, report)
+        text = json.dumps(report, indent=2)
+        if args.json:
+            write_json_atomic(args.json, report)
+        print(text)
+        return
+
+    if args.junos_command == 'ownership':
+        from ablation.analyzers.junos_function_diff import write_json_atomic
+        from ablation.analyzers.mips_ownership import analyze_ownership
+        spec = json.loads(Path(args.spec).read_text())
+
+        def integers(values):
+            return {int(value, 0) if isinstance(value, str) else int(value) for value in values or []}
+
+        functions = []
+        for item in spec.get('functions', []):
+            normalized = dict(item)
+            normalized['va'] = int(normalized['va'], 0) if isinstance(normalized['va'], str) else int(normalized['va'])
+            if isinstance(normalized.get('size'), str):
+                normalized['size'] = int(normalized['size'], 0)
+            functions.append(normalized)
+        if not functions:
+            raise SystemExit('error: ownership specification contains no functions')
+        try:
+            report = analyze_ownership(
+                args.binary, functions,
+                free_functions=integers(spec.get('free_functions')),
+                free_names=set(spec.get('free_names') or ['free', 'mod_free']),
+                allocator_functions=integers(spec.get('allocator_functions')),
+                allocator_names=set(spec.get('allocator_names') or ['malloc', 'calloc', 'mod_kzalloc']),
+                max_paths=args.max_paths, max_steps=args.max_steps,
+            )
+        except ValueError as exc:
+            raise SystemExit(f'error: {exc}') from exc
+        text = json.dumps(report, indent=2)
+        if args.json:
+            write_json_atomic(args.json, report)
+        print(text)
+        return
+
+    if args.junos_command == 'gencfg-graph':
+        from ablation.analyzers.gencfg_provenance import build_provenance_graph
+        from ablation.analyzers.junos_function_diff import write_json_atomic
+        spec = json.loads(Path(args.spec).read_text())
+        try:
+            report = build_provenance_graph(args.root, spec)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f'error: {exc}') from exc
+        text = json.dumps(report, indent=2)
+        if args.json:
+            write_json_atomic(args.json, report)
+        print(text)
+        return
+
+    if args.junos_command == 'provenance-slice':
+        from ablation.analyzers.isa_mips import canon_reg
+        from ablation.analyzers.junos_function_diff import write_json_atomic
+        from ablation.analyzers.mips_message_provenance import analyze_direct_callers
+        arguments = tuple(canon_reg(value.strip()) for value in args.args.split(','))
+        if any(value is None for value in arguments):
+            raise SystemExit('error: --args must be a comma-separated list of MIPS registers')
+        try:
+            report = analyze_direct_callers(
+                args.binary, args.target, arguments=arguments,
+                max_instructions=args.back, max_results=args.max_callers, max_size=args.max_size,
+            )
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f'error: {exc}') from exc
+        text = json.dumps(report, indent=2)
+        if args.json:
+            write_json_atomic(args.json, report)
+        print(text)
+        return
+
+    if args.junos_command == 'extract':
+        from ablation.core.junos_package import extract_package
+        result = extract_package(args.package, args.output, extract_iso=not args.no_iso)
+        print(json.dumps(asdict(result), indent=2))
+        return
+
+    if args.junos_command == 'verify':
+        from ablation.core.junos_package import verify_embedded_hashes
+        from ablation.core.junos_signature import verify_package_directory
+        hashes = verify_embedded_hashes(args.root)
+        signatures = verify_package_directory(args.root)
+        report = {
+            'hashes': [asdict(item) for item in hashes],
+            'signatures': [asdict(item) for item in signatures],
+        }
+        text = json.dumps(report, indent=2)
+        if args.json:
+            Path(args.json).write_text(text + '\n')
+        print(text)
+        if args.require_all and (
+            any(not item.valid for item in hashes)
+            or any(not item.valid or item.chain_valid is False for item in signatures)
+        ):
+            raise SystemExit(1)
+        return
+
+    from ablation.analyzers.binary_diff import build_manifest, diff_manifests, manifest_json
+    if args.junos_command == 'inventory':
+        records = build_manifest(args.root)
+        text = manifest_json(records)
+        if args.json:
+            Path(args.json).write_text(text + '\n')
+        print(json.dumps({
+            'entries': len(records),
+            'files': sum(record.kind == 'file' for record in records.values()),
+            'symlinks': sum(record.kind == 'symlink' for record in records.values()),
+            'elf': sum(record.elf for record in records.values()),
+        }, indent=2))
+        return
+
+    old = build_manifest(args.old)
+    new = build_manifest(args.new)
+    report = diff_manifests(old, new)
+    selected = list(args.functions or [])
+    if args.top_k:
+        selected.extend(change['path'] for change in report['ranked'][:args.top_k])
+    selected = list(dict.fromkeys(selected))
+    if selected:
+        from ablation.analyzers.binary_diff import compare_elf, diff_elf_functions
+        deep = {}
+        for relative in selected:
+            old_path = Path(args.old, relative)
+            new_path = Path(args.new, relative)
+            if not old_path.is_file() or not new_path.is_file():
+                raise SystemExit(f'error: diff target must exist in both trees: {relative}')
+            deep[relative] = {
+                'elf': compare_elf(old_path, new_path),
+                'functions': diff_elf_functions(old_path, new_path),
+            }
+        report['deep'] = deep
+    text = json.dumps(report, indent=2)
+    if args.json:
+        Path(args.json).write_text(text + '\n')
+        print(f"Wrote Junos diff to {args.json}")
+    else:
+        print(json.dumps(report['summary'], indent=2))
+        for change in report['ranked'][:20]:
+            print(f"{change['delta']:>10} {change['status']:<8} {change['path']}")
+
+
+def _emit_json(report, output=None):
+    text = json.dumps(report, indent=2)
+    if output:
+        Path(output).write_text(text + '\n')
+        print(f"Wrote JSON to {output}")
+    else:
+        print(text)
+
+
+def cmd_android(args):
+    from ablation.core.android_package import AndroidPackage
+    from ablation.analyzers.apk_jni_mapper import APKJNIMapper
+
+    with AndroidPackage.from_path(str(_require_binary(args.package))) as package:
+        if args.android_command == 'inventory':
+            _emit_json(package.to_dict(), args.json)
+            return
+        if args.android_command == 'xml':
+            print(package.decode_xml(args.apk_name, args.entry))
+            return
+        if args.android_command == 'decompile':
+            from ablation.core.apk_parser import APKParser
+            from ablation.analyzers.dex_decompiler import DEXDecompiler
+
+            apk_name = args.apk_name
+            if not apk_name:
+                apk_name = next(
+                    (name for name in package.apk_names() if package.split_id(name) == 'base'),
+                    package.apk_names()[0],
+                )
+            with APKParser.from_bytes(package.read_apk(apk_name), name=apk_name) as apk:
+                decompiler = DEXDecompiler(apk.read_dex(args.dex))
+            if args.class_name:
+                if args.method:
+                    class_name = args.class_name if args.class_name.startswith('L') else 'L' + args.class_name.replace('.', '/') + ';'
+                    matches = [
+                        method for method in decompiler.iter_methods()
+                        if method.class_name == class_name and method.name == args.method
+                    ]
+                    if not matches:
+                        raise SystemExit('error: method not found')
+                    text = '\n\n'.join(decompiler.decompile_method(method) for method in matches)
+                else:
+                    text = decompiler.decompile_class(args.class_name)
+            else:
+                text = json.dumps({
+                    'classes': len(decompiler.classes),
+                    'methods': len(list(decompiler.iter_methods())),
+                    'native_methods': len(list(decompiler.iter_native_methods())),
+                    'hint': 'use --class and optionally --method to emit Java-like source',
+                }, indent=2)
+            if args.output:
+                Path(args.output).write_text(text + '\n')
+                print(f"Wrote decompilation to {args.output}")
+            else:
+                print(text)
+            return
+        if args.android_command == 'jni':
+            mapper = APKJNIMapper(package)
+            graph = mapper.analyze()
+            _emit_json(graph.to_dict(), args.json)
+            return
+        if args.android_command == 'trace':
+            from ablation.analyzers.cross_layer_taint import CrossLayerTaintAnalyzer
+
+            analyzer = CrossLayerTaintAnalyzer(APKJNIMapper(package), max_iterations=args.iterations)
+            report = analyzer.analyze()
+            _emit_json(report.to_dict(), args.json)
+            return
+        raise SystemExit(f"error: unsupported Android command: {args.android_command}")
+
+
+def cmd_elf_disasm(args):
+    from ablation.analyzers.elf_disassembler import ELFDisassembler
+
+    elf = ELFDisassembler.from_path(str(_require_binary(args.binary)))
+    address = int(args.va, 0)
+    if args.function:
+        instructions = elf.disassemble_function(address, thumb=args.thumb)
+    else:
+        instructions = elf.disassemble(address, args.size, thumb=args.thumb)
+    print(f"{elf.name}: {elf.architecture}, {len(instructions)} instructions")
+    for insn in instructions:
+        print(insn.text())
+
+
+def cmd_news(args):
+    print(_RECENT_UPDATES)
+
+
+def cmd_sigs(args):
+    from ablation.analyzers.sig_library import SigLibrary
+
+    lib = SigLibrary(threshold=args.threshold)
+
+    if args.list:
+        for s in lib.known_signatures():
+            print(f"  {s['name']:<25s} [{s.get('category','')}]  {s['description'][:60]}")
+        return
+
+    db = Path(args.db).expanduser()
+    if not db.exists():
+        print(f"error: DB not found: {db}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Loading model ...")
+    lib.load_model()
+    print(f"Matching {len(lib.known_signatures())} signatures against {db.name} ...")
+    n = lib.auto_name(str(db), dry_run=args.dry_run)
+    tag = "(dry-run) would rename" if args.dry_run else "renamed"
+    print(f"{tag} {n} functions")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='ablation',
+        description='Semantic firmware analysis for vulnerability researchers.',
+    )
+    sub = parser.add_subparsers(dest='command', metavar='<command>')
+    sub.required = True
+
+    # analyze
+    p_analyze = sub.add_parser('analyze', help='binary summary, strings, entropy')
+    p_analyze.add_argument('binary')
+    p_analyze.add_argument('--entropy', action='store_true', help='include entropy scan')
+    p_analyze.set_defaults(func=cmd_analyze)
+
+    p_android = sub.add_parser('android', help='APK/XAPK, DEX, JNI, and cross-layer analysis')
+    android_sub = p_android.add_subparsers(dest='android_command', metavar='<command>')
+    android_sub.required = True
+    p_android_inventory = android_sub.add_parser('inventory', help='decode package and split APK metadata')
+    p_android_inventory.add_argument('package')
+    p_android_inventory.add_argument('--json', help='write JSON to FILE')
+    p_android_inventory.set_defaults(func=cmd_android)
+    p_android_xml = android_sub.add_parser('xml', help='decode binary Android XML')
+    p_android_xml.add_argument('package')
+    p_android_xml.add_argument('apk_name')
+    p_android_xml.add_argument('entry')
+    p_android_xml.set_defaults(func=cmd_android)
+    p_android_decompile = android_sub.add_parser('decompile', help='emit Java-like DEX source')
+    p_android_decompile.add_argument('package')
+    p_android_decompile.add_argument('--apk', dest='apk_name', help='embedded APK name (default: base)')
+    p_android_decompile.add_argument('--dex', default='classes.dex')
+    p_android_decompile.add_argument('--class', dest='class_name')
+    p_android_decompile.add_argument('--method')
+    p_android_decompile.add_argument('--output', help='write source to FILE')
+    p_android_decompile.set_defaults(func=cmd_android)
+    p_android_jni = android_sub.add_parser('jni', help='map Java native methods to ELF implementations')
+    p_android_jni.add_argument('package')
+    p_android_jni.add_argument('--json', help='write JSON to FILE')
+    p_android_jni.set_defaults(func=cmd_android)
+    p_android_trace = android_sub.add_parser('trace', help='trace DEX sources through JNI to native sinks')
+    p_android_trace.add_argument('package')
+    p_android_trace.add_argument('--iterations', type=int, default=6)
+    p_android_trace.add_argument('--json', help='write JSON to FILE')
+    p_android_trace.set_defaults(func=cmd_android)
+
+    p_elf_disasm = sub.add_parser('elf-disasm', help='disassemble an ELF virtual address')
+    p_elf_disasm.add_argument('binary')
+    p_elf_disasm.add_argument('va', help='virtual address, hexadecimal accepted')
+    p_elf_disasm.add_argument('--size', type=lambda value: int(value, 0), default=0x80)
+    p_elf_disasm.add_argument('--function', action='store_true', help='use symbol/function boundaries')
+    p_elf_disasm.add_argument('--thumb', action='store_true', default=None, help='force ARM Thumb mode')
+    p_elf_disasm.set_defaults(func=cmd_elf_disasm)
+
+    p_junos = sub.add_parser('junos', help='Junos package, signature, inventory, and diff workflows')
+    junos_sub = p_junos.add_subparsers(dest='junos_command', metavar='<command>')
+    junos_sub.required = True
+    p_junos_target = junos_sub.add_parser('target', help='report Junos target and ELF ISA/ABI')
+    p_junos_target.add_argument('binary')
+    p_junos_target.set_defaults(func=cmd_junos)
+    p_junos_xrefs = junos_sub.add_parser('xrefs', help='resolve a string to internal MIPS functions')
+    p_junos_xrefs.add_argument('binary')
+    p_junos_xrefs.add_argument('substring')
+    p_junos_xrefs.set_defaults(func=cmd_junos)
+    p_junos_overlay = junos_sub.add_parser('overlay', help='recover and persist Junos function names')
+    p_junos_overlay.add_argument('binary')
+    p_junos_overlay.set_defaults(func=cmd_junos)
+    p_junos_gencfg = junos_sub.add_parser('gencfg', help='validate a gencfg message against Junos schemas')
+    p_junos_gencfg.add_argument('message', nargs='?', help='hexadecimal message bytes')
+    p_junos_gencfg.add_argument('--family', default='vrf-group')
+    p_junos_gencfg.add_argument('--list', dest='list_schemas', action='store_true', help='list schemas')
+    p_junos_gencfg.add_argument('--encode', action='store_true', help='construct and validate a VRF-group message')
+    p_junos_gencfg.add_argument('--group-id', type=lambda value: int(value, 0), default=0)
+    p_junos_gencfg.add_argument('--lsys-id', type=lambda value: int(value, 0), default=0)
+    p_junos_gencfg.add_argument('--operation', type=lambda value: int(value, 0), default=2)
+    p_junos_gencfg.add_argument('--vrf', type=lambda value: int(value, 0), action='append', help='VRF ID; repeat for multiple entries')
+    p_junos_gencfg.set_defaults(func=cmd_junos)
+    p_junos_fdiff = junos_sub.add_parser('function-diff', help='compare two explicitly bounded MIPS functions')
+    p_junos_fdiff.add_argument('old')
+    p_junos_fdiff.add_argument('new')
+    p_junos_fdiff.add_argument('old_va', type=lambda value: int(value, 0))
+    p_junos_fdiff.add_argument('new_va', type=lambda value: int(value, 0))
+    p_junos_fdiff.add_argument('--old-size', type=lambda value: int(value, 0))
+    p_junos_fdiff.add_argument('--new-size', type=lambda value: int(value, 0))
+    p_junos_fdiff.add_argument('--max-size', type=lambda value: int(value, 0), default=16384)
+    p_junos_fdiff.add_argument('--timeout', type=float, default=30.0)
+    p_junos_fdiff.add_argument('--cache', help='directory for content-addressed, resumable results')
+    p_junos_fdiff.add_argument('--json', help='write the complete comparison atomically')
+    p_junos_fdiff.set_defaults(func=cmd_junos)
+    p_junos_owner = junos_sub.add_parser('ownership', help='analyze bounded MIPS pointer ownership paths')
+    p_junos_owner.add_argument('binary')
+    p_junos_owner.add_argument('spec', help='JSON function and allocator/free model')
+    p_junos_owner.add_argument('--max-paths', type=int, default=256)
+    p_junos_owner.add_argument('--max-steps', type=int, default=20000)
+    p_junos_owner.add_argument('--json', help='write the complete ownership report')
+    p_junos_owner.set_defaults(func=cmd_junos)
+    p_junos_graph = junos_sub.add_parser('gencfg-graph', help='verify and report gencfg provenance and authorization edges')
+    p_junos_graph.add_argument('root', help='extracted Junos root for relative binary paths')
+    p_junos_graph.add_argument('spec', help='JSON node, edge, transport, and authorization specification')
+    p_junos_graph.add_argument('--json', help='write the complete graph report')
+    p_junos_graph.set_defaults(func=cmd_junos)
+    p_junos_slice = junos_sub.add_parser('provenance-slice', help='trace direct callers and basic-block call arguments')
+    p_junos_slice.add_argument('binary')
+    p_junos_slice.add_argument('target', type=lambda value: int(value, 0), help='callee virtual address')
+    p_junos_slice.add_argument('--args', default='a0,a1,a2', help='comma-separated argument registers')
+    p_junos_slice.add_argument('--back', type=int, default=64, help='backward instruction and event budget')
+    p_junos_slice.add_argument('--max-callers', type=int, default=64)
+    p_junos_slice.add_argument('--max-size', type=int, default=16384, help='maximum caller function size in bytes')
+    p_junos_slice.add_argument('--json', help='write the complete provenance report atomically')
+    p_junos_slice.set_defaults(func=cmd_junos)
+    p_junos_extract = junos_sub.add_parser('extract', help='extract a signed Junos package')
+    p_junos_extract.add_argument('package')
+    p_junos_extract.add_argument('output')
+    p_junos_extract.add_argument('--no-iso', action='store_true', help='stop after recovering the ISO')
+    p_junos_extract.set_defaults(func=cmd_junos)
+    p_junos_verify = junos_sub.add_parser('verify', help='verify hashes and detached RSA/EC signatures')
+    p_junos_verify.add_argument('root')
+    p_junos_verify.add_argument('--json', help='write JSON report')
+    p_junos_verify.add_argument('--require-all', action='store_true', help='fail if any verification fails')
+    p_junos_verify.set_defaults(func=cmd_junos)
+    p_junos_inventory = junos_sub.add_parser('inventory', help='build a filesystem and ELF manifest')
+    p_junos_inventory.add_argument('root')
+    p_junos_inventory.add_argument('--json', help='write complete manifest JSON')
+    p_junos_inventory.set_defaults(func=cmd_junos)
+    p_junos_diff = junos_sub.add_parser('diff', help='compare two extracted Junos userlands')
+    p_junos_diff.add_argument('old')
+    p_junos_diff.add_argument('new')
+    p_junos_diff.add_argument('--json', help='write complete diff JSON')
+    p_junos_diff.add_argument('--functions', nargs='+', help='relative ELF paths for function-level diff')
+    p_junos_diff.add_argument('--top-k', type=int, default=0, help='deep-diff the K largest changed ELFs')
+    p_junos_diff.set_defaults(func=cmd_junos)
+
+    # search
+    p_search = sub.add_parser('search', help='semantic function search')
+    p_search.add_argument('binary')
+    p_search.add_argument('query')
+    p_search.add_argument('--top-k', type=int, default=10)
+    p_search.add_argument('--db', default=str(_DEFAULT_DB), help='func_id DB path')
+    p_search.set_defaults(func=cmd_search)
+
+    # taint
+    p_taint = sub.add_parser('taint', help='taint analysis: network sources to sinks (arch-aware)')
+    p_taint.add_argument('binary')
+    p_taint.add_argument('--interprocedural', action='store_true',
+                         help='cross-function BFS taint tracking (x86-64)')
+    p_taint.add_argument('--flow-sensitive', action='store_true',
+                         help='CFG MFP fixpoint + interprocedural BFS (most precise, x86-64)')
+    p_taint.add_argument('--depth', type=int, default=4,
+                         help='max hop depth for interprocedural analysis (default 4)')
+    p_taint.set_defaults(func=cmd_taint)
+
+    # overflow
+    p_overflow = sub.add_parser('overflow', help='ARM32 integer overflow scan: MUL -> alloc without check')
+    p_overflow.add_argument('binary')
+    p_overflow.set_defaults(func=cmd_overflow)
+
+    # window
+    p_window = sub.add_parser('window', help='annotated disassembly window around a VA')
+    p_window.add_argument('binary')
+    p_window.add_argument('va', help='center VA in hex, e.g. 0x1234')
+    p_window.add_argument('--window', type=int, default=1536, help='bytes to disassemble (default 1536)')
+    p_window.add_argument('--back', type=int, default=0, help='bytes before VA to include')
+    p_window.add_argument('--calls', action='store_true', help='list call sites in window')
+    p_window.add_argument('--funcs', action='store_true', help='list function starts in window')
+    p_window.set_defaults(func=cmd_window)
+
+    # profile
+    p_profile = sub.add_parser('profile', help='full function profile: strings + call args + sinks')
+    p_profile.add_argument('binary')
+    p_profile.add_argument('va', help='function VA in hex, e.g. 0x1234')
+    p_profile.set_defaults(func=cmd_profile)
+
+    # cfg
+    p_cfg = sub.add_parser('cfg', help='control-flow graph for one function')
+    p_cfg.add_argument('binary')
+    p_cfg.add_argument('va', help='function VA in hex, e.g. 0x1234')
+    p_cfg.add_argument('--insns', action='store_true', help='print instructions')
+    p_cfg.set_defaults(func=cmd_cfg)
+
+    # crypto
+    p_crypto = sub.add_parser('crypto', help='entropy scan and crypto key detection')
+    p_crypto.add_argument('binary')
+    p_crypto.set_defaults(func=cmd_crypto)
+
+    # corpus
+    p_corpus = sub.add_parser('corpus', help='build semantic function corpus')
+    p_corpus.add_argument('binary')
+    p_corpus.add_argument('--product', default=None)
+    p_corpus.add_argument('--version', default=None)
+    p_corpus.add_argument('--db', default=str(_DEFAULT_DB), help='func_id DB path')
+    p_corpus.add_argument('--sigs', action='store_true', help='auto-name fn_0x* functions after build')
+    p_corpus.set_defaults(func=cmd_corpus)
+
+    # sweep
+    p_sweep = sub.add_parser('sweep', help='run all registered patterns against a binary')
+    p_sweep.add_argument('binary')
+    p_sweep.add_argument('--top-k', type=int, default=5)
+    p_sweep.add_argument('--min-score', type=float, default=0.30)
+    p_sweep.add_argument('--db', default=str(_DEFAULT_DB), help='func_id DB path')
+    p_sweep.add_argument('--sarif', metavar='FILE', default=None, help='write SARIF 2.1.0 to FILE')
+    p_sweep.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_sweep.set_defaults(func=cmd_sweep)
+
+    # driver
+    p_driver = sub.add_parser('driver', help='Windows .sys kernel driver analysis (IOCTL, callbacks, dangerous patterns)')
+    p_driver.add_argument('binary')
+    p_driver.add_argument('--json', metavar='FILE', default=None, help='write JSON summary to FILE')
+    p_driver.set_defaults(func=cmd_driver)
+
+    # byovd
+    p_byovd = sub.add_parser('byovd', help='BYOVD risk score: signed driver + IOCTL + dangerous primitive')
+    p_byovd.add_argument('binary')
+    p_byovd.add_argument('--json', metavar='FILE', default=None, help='write JSON summary to FILE')
+    p_byovd.set_defaults(func=cmd_byovd)
+
+    # fmtstr
+    p_fmtstr = sub.add_parser('fmtstr', help='format string vulnerability scan (printf/syslog/err with non-literal format arg)')
+    p_fmtstr.add_argument('binary')
+    p_fmtstr.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_fmtstr.set_defaults(func=cmd_fmtstr)
+
+    # heap
+    p_heap = sub.add_parser('heap', help='heap vulnerability scan: int overflow before alloc, UAF, double-free, off-by-one')
+    p_heap.add_argument('binary')
+    p_heap.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_heap.set_defaults(func=cmd_heap)
+
+    # mips (MIPS32 O32)
+    p_mips = sub.add_parser('mips', help='MIPS 32+nM taint analysis: recv/read to system/strcpy/exec (O32 ABI)')
+    p_mips.add_argument('binary')
+    p_mips.add_argument('--le', action='store_true', help='little-endian (default: big-endian)')
+    p_mips.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_mips.set_defaults(func=cmd_mips)
+
+    # mips64 (MIPS64 N64)
+    p_mips64 = sub.add_parser('mips64', help='MIPS 64 taint analysis: N64 ABI; Cisco IOS/OCTEON + RouterOS 64')
+    p_mips64.add_argument('binary')
+    p_mips64.add_argument('--le', action='store_true', help='little-endian (default: big-endian)')
+    p_mips64.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_mips64.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_mips64.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_mips64.set_defaults(func=cmd_mips64)
+
+    # nanomips (nanoMIPS frame decoder)
+    p_nm = sub.add_parser('nanomips', help='nanoMIPS frame decoder: function-start detection, frame walk (Ingenic/MediaTek)')
+    p_nm.add_argument('binary')
+    p_nm.add_argument('--le', action='store_true', help='little-endian (default: big-endian)')
+    p_nm.add_argument('--base', type=lambda x: int(x, 0), default=0, help='base address (default: 0)')
+    p_nm.add_argument('--frames', action='store_true', help='dump frame listing instead of function starts')
+    p_nm.add_argument('--limit', type=int, default=0, help='max frames to print (0 = all)')
+    p_nm.add_argument('--json', metavar='FILE', default=None, help='write function starts JSON to FILE')
+    p_nm.set_defaults(func=cmd_nanomips)
+
+    # nanomips-taint (nanoMIPS taint tracker)
+    p_nmt = sub.add_parser('nanomips-taint', help='nanoMIPS taint analysis: O32 ABI; Ingenic X-series, MediaTek Helio embedded')
+    p_nmt.add_argument('binary')
+    p_nmt.add_argument('--le', action='store_true', help='little-endian (default: big-endian)')
+    p_nmt.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_nmt.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_nmt.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_nmt.set_defaults(func=cmd_nanomips_taint)
+
+    # ppc32 (PowerPC 32-bit taint tracker)
+    p_ppc32 = sub.add_parser('ppc32', help='PPC32 taint analysis: System V/EABI; Cisco IOS, VxWorks, MikroTik RB600')
+    p_ppc32.add_argument('binary')
+    p_ppc32.add_argument('--le', action='store_true', help='little-endian (default: big-endian)')
+    p_ppc32.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_ppc32.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_ppc32.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_ppc32.set_defaults(func=cmd_ppc32)
+
+    # ppc64 (PowerPC 64-bit taint tracker)
+    p_ppc64 = sub.add_parser('ppc64', help='PPC64 taint analysis: ELFv2/ELFv1; IBM POWER, OpenPOWER Linux, AIX')
+    p_ppc64.add_argument('binary')
+    p_ppc64.add_argument('--le', action='store_true', help='little-endian POWER8+ (default: big-endian)')
+    p_ppc64.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_ppc64.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_ppc64.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_ppc64.set_defaults(func=cmd_ppc64)
+
+    # riscv64 (RISC-V 64-bit taint tracker)
+    p_riscv64 = sub.add_parser('riscv64', help='RISC-V 64 taint analysis: lp64 ABI; VisionFive 2, SiFive Unmatched, Milk-V Pioneer, SpacemiT K1')
+    p_riscv64.add_argument('binary')
+    p_riscv64.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_riscv64.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_riscv64.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_riscv64.set_defaults(func=cmd_riscv64)
+
+    # riscv32 (RISC-V 32-bit taint tracker)
+    p_riscv32 = sub.add_parser('riscv32', help='RISC-V 32 taint analysis: ilp32 ABI; SiFive, StarFive, Allwinner D1, ESP32-C3, GD32VF103')
+    p_riscv32.add_argument('binary')
+    p_riscv32.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_riscv32.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_riscv32.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_riscv32.set_defaults(func=cmd_riscv32)
+
+    # arc (ARC taint tracker)
+    p_arc = sub.add_parser('arc', help='ARC taint analysis: ARC EM/HS/770D; smart TV SoCs, storage controllers, automotive')
+    p_arc.add_argument('binary')
+    p_arc.add_argument('--be', action='store_true', help='big-endian (default: little-endian)')
+    p_arc.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_arc.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_arc.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_arc.set_defaults(func=cmd_arc)
+
+    # arc-decode (ARC frame decoder)
+    p_arc_decode = sub.add_parser('arc-decode', help='ARC instruction frame decoder: width discriminant + BL/J[blink] classification')
+    p_arc_decode.add_argument('binary')
+    p_arc_decode.add_argument('--be', action='store_true', help='big-endian (default: little-endian)')
+    p_arc_decode.add_argument('--base', type=lambda x: int(x, 0), default=0, help='base VA for .text (hex ok)')
+    p_arc_decode.add_argument('--frames', action='store_true', help='dump all frames (not just control-flow)')
+    p_arc_decode.add_argument('--limit', type=int, default=0, help='limit output to N frames (0 = all)')
+    p_arc_decode.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_arc_decode.set_defaults(func=cmd_arc_decode)
+
+    # v850 (V850 taint tracker)
+    p_v850 = sub.add_parser('v850', help='V850 taint analysis: V850 EABI; RH850/G3M automotive ECU, V850E2R industrial, V850E3V5 ASIL-D')
+    p_v850.add_argument('binary')
+    p_v850.add_argument('--be', action='store_true', help='big-endian (default: little-endian)')
+    p_v850.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_v850.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_v850.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_v850.set_defaults(func=cmd_v850)
+
+    # v850-decode (V850 frame decoder)
+    p_v850_decode = sub.add_parser('v850-decode', help='V850 instruction frame decoder: 16/32-bit width discriminant + JARL/JMP[lp] classification')
+    p_v850_decode.add_argument('binary')
+    p_v850_decode.add_argument('--be', action='store_true', help='big-endian (default: little-endian)')
+    p_v850_decode.add_argument('--base', type=lambda x: int(x, 0), default=0, help='base VA for .text (hex ok)')
+    p_v850_decode.add_argument('--frames', action='store_true', help='dump all frames (not just control-flow)')
+    p_v850_decode.add_argument('--limit', type=int, default=0, help='limit output to N frames (0 = all)')
+    p_v850_decode.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_v850_decode.set_defaults(func=cmd_v850_decode)
+
+    # loongarch64 (LoongArch64 taint tracker)
+    p_la64 = sub.add_parser('loongarch64', help='LoongArch64 taint analysis: lp64 ABI; TencentOS 4.6, Loongson 3A5000/3C5000, kernel modules')
+    p_la64.add_argument('binary')
+    p_la64.add_argument('--interprocedural', action='store_true', help='cross-function BFS (default: intraprocedural)')
+    p_la64.add_argument('--depth', type=int, default=4, help='BFS depth (default: 4)')
+    p_la64.add_argument('--full', action='store_true', help='use from_path_full: .eh_frame FDE + DWARF + BTF for precise function boundaries')
+    p_la64.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_la64.set_defaults(func=cmd_loongarch64)
+
+    # loongarch64-decode (LoongArch64 frame decoder)
+    p_la64d = sub.add_parser('loongarch64-decode', help='LoongArch64 instruction frame decoder: fixed 32-bit width, jirl polymorphism, branch classification')
+    p_la64d.add_argument('binary')
+    p_la64d.add_argument('--base', type=lambda x: int(x, 0), default=0, help='base VA for .text (hex ok)')
+    p_la64d.add_argument('--frames', action='store_true', help='dump all frames (not just function starts)')
+    p_la64d.add_argument('--limit', type=int, default=0, help='limit output to N frames (0 = all)')
+    p_la64d.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_la64d.set_defaults(func=cmd_loongarch64_decode)
+
+    # news
+    p_news = sub.add_parser('news', help='show recent updates')
+    p_news.set_defaults(func=cmd_news)
+
+    # findings
+    p_findings = sub.add_parser('findings', help='list confirmed findings')
+    p_findings.add_argument('--sarif', metavar='FILE', default=None, help='write SARIF 2.1.0 to FILE')
+    p_findings.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
+    p_findings.set_defaults(func=cmd_findings)
+
+    # sigs
+    p_sigs = sub.add_parser('sigs', help='match and auto-name functions from signature library')
+    p_sigs.add_argument('--db', default=str(_DEFAULT_DB), help='func_id DB path')
+    p_sigs.add_argument('--threshold', type=float, default=0.62, help='similarity threshold (0-1)')
+    p_sigs.add_argument('--dry-run', action='store_true', help='report matches without writing')
+    p_sigs.add_argument('--list', action='store_true', help='list all signatures in the library')
+    p_sigs.set_defaults(func=cmd_sigs)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        if '--debug' in sys.argv:
+            raise
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

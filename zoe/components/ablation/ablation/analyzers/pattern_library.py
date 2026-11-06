@@ -1,0 +1,493 @@
+"""
+pattern_library.py: Persistent registry of successful semantic search patterns.
+
+Accumulates query strings that have confirmed RE findings, with hit rates per binary.
+Auto-replays all confirmed patterns on new binaries via sweep().
+
+Storage: ~/.ablation/patterns.json
+
+Usage:
+    pl = PatternLibrary()
+    pl.list()  # show all patterns with hit rates
+
+    # Sweep all patterns against a SemanticSearcher instance:
+    results = pl.sweep(searcher, top_k=5)
+    for pattern, hits in results.items():
+        print(f"{pattern}: {len(hits)} hits")
+
+    # Record a confirmed finding:
+    pl.record_hit('strcpy with user-controlled src', binary='libdata.so', va=0x5000, confirmed=True)
+    pl.save()
+
+    # Add new pattern:
+    pl.add('CLI handler passes argv directly to exec without sanitization',
+           tag='cmd-exec')
+    pl.save()
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+_STORE_DIR = Path.home() / ".ablation"
+_STORE_PATH = _STORE_DIR / "patterns.json"
+
+# Increment when new default patterns are added. On load, if the stored
+# schema_version is older, new defaults are merged without losing confirmed hits.
+_SCHEMA_VERSION = 2
+
+# Default patterns seeded on first load.
+# These cover the most common firmware vuln classes and have been validated on FMG 8.0.0.
+_DEFAULT_PATTERNS = [
+    {
+        "query": "strcpy or strcat called with source from user-controlled config string, no length check",
+        "tag": "buffer-overflow",
+    },
+    {
+        "query": "sprintf or vsprintf called with format string from user-controlled input",
+        "tag": "buffer-overflow",
+    },
+    {
+        "query": "system or popen called with command string constructed from network input",
+        "tag": "cmd-exec",
+    },
+    {
+        "query": "Tcl_Eval called with script constructed from user-supplied config or CLI argument",
+        "tag": "tcl-inject",
+    },
+    {
+        "query": "exec or execve called with argv from user-controlled input without sanitization",
+        "tag": "cmd-exec",
+    },
+    {
+        "query": "CLI handler function passes entry argument directly to shell or exec function",
+        "tag": "cmd-exec",
+    },
+    {
+        "query": "user-controlled path joined or concatenated without realpath or traversal check",
+        "tag": "path-traversal",
+    },
+    {
+        "query": "config file field parsed into fixed-size stack buffer with no bounds check",
+        "tag": "buffer-overflow",
+    },
+    {
+        "query": "password or secret compared with strcmp instead of constant-time function",
+        "tag": "timing-side-channel",
+    },
+    {
+        "query": "unchecked length from network packet used in malloc or alloca size calculation",
+        "tag": "heap-overflow",
+    },
+    {
+        "query": "CLI command string constructed from user input and evaluated without sanitization",
+        "tag": "cmd-inject",
+    },
+    {
+        "query": "function registers CLI tree node with exec callback that receives argv directly",
+        "tag": "cmd-exec",
+    },
+    # Integer overflow / truncation
+    {
+        "query": "arithmetic on user-controlled size or count value used as allocation argument, possible integer overflow or wrap",
+        "tag": "integer-overflow",
+    },
+    {
+        "query": "multiplication of user-supplied count and element-size passed to malloc without overflow check",
+        "tag": "integer-overflow",
+    },
+    # Use-after-free / double-free
+    {
+        "query": "pointer freed inside loop or error path then dereferenced or freed again in cleanup",
+        "tag": "use-after-free",
+    },
+    {
+        "query": "object reference passed to free then referenced again in subsequent callback or signal handler",
+        "tag": "use-after-free",
+    },
+    {
+        "query": "heap pointer freed twice on error unwind with no NULL assignment between frees",
+        "tag": "double-free",
+    },
+    # Format string
+    {
+        "query": "printf or syslog called with user-controlled argument directly in format position",
+        "tag": "format-string",
+    },
+    {
+        "query": "log or debug function constructs format string from user-supplied message field",
+        "tag": "format-string",
+    },
+    # Race conditions
+    {
+        "query": "shared counter or flag read and written from multiple threads without mutex protection",
+        "tag": "race-condition",
+    },
+    {
+        "query": "check-then-use pattern on file or socket descriptor across a non-atomic operation",
+        "tag": "race-condition",
+    },
+    # DoS / resource exhaustion
+    {
+        "query": "loop iterates until packet field reaches zero, no iteration bound, possible infinite loop",
+        "tag": "dos",
+    },
+    {
+        "query": "memory allocation inside parsing loop driven by attacker-controlled count field, no upper bound",
+        "tag": "dos",
+    },
+    # Info leak
+    {
+        "query": "stack buffer or heap object returned in response without zeroing uninitialized bytes",
+        "tag": "info-leak",
+    },
+    {
+        "query": "error response includes pointer value, kernel address, or internal struct field",
+        "tag": "info-leak",
+    },
+    # Auth bypass
+    {
+        "query": "authentication check returns success when underlying function returns error code",
+        "tag": "auth-bypass",
+    },
+    {
+        "query": "session token or credential comparison short-circuits on empty or null input",
+        "tag": "auth-bypass",
+    },
+    # Crypto misuse
+    {
+        "query": "IV or nonce reused across encryption calls, or nonce derived from predictable counter",
+        "tag": "crypto",
+    },
+    {
+        "query": "SSL or TLS certificate verification disabled or return value from verify callback ignored",
+        "tag": "crypto",
+    },
+]
+
+
+@dataclass
+class PatternHit:
+    binary: str
+    va: int
+    score: float
+    confirmed: bool = False
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class Pattern:
+    query: str
+    tag: str = ""
+    hits: List[PatternHit] = field(default_factory=list)
+    created: float = field(default_factory=time.time)
+
+    @property
+    def confirmed_hit_count(self) -> int:
+        return sum(1 for h in self.hits if h.confirmed)
+
+    @property
+    def total_hit_count(self) -> int:
+        return len(self.hits)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "tag": self.tag,
+            "hits": [asdict(h) for h in self.hits],
+            "created": self.created,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Pattern":
+        _hit_fields = {"binary", "va", "score", "confirmed", "timestamp"}
+        hits = []
+        for h in d.get("hits", []):
+            if not isinstance(h, dict) or "binary" not in h:
+                continue
+            try:
+                hits.append(PatternHit(**{k: v for k, v in h.items() if k in _hit_fields}))
+            except (TypeError, ValueError):
+                pass
+        return cls(
+            query=d["query"],
+            tag=d.get("tag", ""),
+            hits=hits,
+            created=d.get("created", 0.0),
+        )
+
+
+@dataclass
+class SweepResult:
+    pattern: str
+    tag: str
+    hits: List[Tuple[int, float]]  # (va, score)
+
+
+class PatternLibrary:
+    """
+    Persistent registry of semantic search patterns with hit tracking.
+
+    Backed by ~/.ablation/patterns.json. First instantiation seeds default patterns.
+    Thread-safe for concurrent ingest: a per-instance lock serialises save() calls.
+    """
+
+    def __init__(self, store_path: Optional[str] = None):
+        self._path = Path(store_path) if store_path else _STORE_PATH
+        self._patterns: List[Pattern] = []
+        self._lock = threading.RLock()
+        self._load()
+
+    # ── load / save ──────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        _STORE_DIR.mkdir(parents=True, exist_ok=True)
+        stored_version = 0
+        if self._path.exists():
+            try:
+                data = json.loads(self._path.read_text())
+                raw_patterns = data.get("patterns", [])
+                if not isinstance(raw_patterns, list):
+                    raise ValueError("patterns field is not a list")
+                stored_version = data.get("schema_version", 0)
+            except (json.JSONDecodeError, KeyError, ValueError, AttributeError):
+                self._patterns = []
+                raw_patterns = []
+            for p in raw_patterns:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    self._patterns.append(Pattern.from_dict(p))
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    pass  # skip this entry, keep the rest
+        if not self._patterns:
+            self._seed_defaults()
+        elif stored_version < _SCHEMA_VERSION:
+            self._merge_new_defaults()
+
+    def save(self) -> None:
+        with self._lock:
+            _STORE_DIR.mkdir(parents=True, exist_ok=True)
+            data = {"schema_version": _SCHEMA_VERSION, "patterns": [p.to_dict() for p in self._patterns]}
+            self._path.write_text(json.dumps(data, indent=2))
+
+    def _seed_defaults(self) -> None:
+        for d in _DEFAULT_PATTERNS:
+            self._patterns.append(Pattern(query=d["query"], tag=d["tag"]))
+
+    def _merge_new_defaults(self) -> None:
+        existing = {p.query for p in self._patterns}
+        for d in _DEFAULT_PATTERNS:
+            if d["query"] not in existing:
+                self._patterns.append(Pattern(query=d["query"], tag=d["tag"]))
+        self.save()
+
+    # ── management ───────────────────────────────────────────────────────────
+
+    def add(self, query: str, tag: str = "") -> Pattern:
+        """Add a new pattern. Returns the Pattern object."""
+        for p in self._patterns:
+            if p.query == query:
+                return p  # already exists
+        p = Pattern(query=query, tag=tag)
+        self._patterns.append(p)
+        return p
+
+    def remove(self, query: str) -> bool:
+        """Remove pattern by exact query string. Returns True if found."""
+        before = len(self._patterns)
+        self._patterns = [p for p in self._patterns if p.query != query]
+        return len(self._patterns) < before
+
+    def get(self, query: str) -> Optional[Pattern]:
+        for p in self._patterns:
+            if p.query == query:
+                return p
+        return None
+
+    def list(self, tag: Optional[str] = None) -> str:
+        """Return formatted table of patterns with hit stats."""
+        patterns = self._patterns
+        if tag is not None:
+            patterns = [p for p in patterns if p.tag == tag]
+        lines = [
+            f"PatternLibrary: {len(patterns)} patterns  ({self._path})",
+            f"  {'Tag':<20} {'Confirmed':>9} {'Total':>6}  Query",
+            f"  {'-'*20} {'--------':>9} {'-----':>6}  -----",
+        ]
+        for p in sorted(patterns, key=lambda x: -x.confirmed_hit_count):
+            tag_col = (p.tag or "")[:20]
+            lines.append(
+                f"  {tag_col:<20} {p.confirmed_hit_count:>9} {p.total_hit_count:>6}  {p.query[:70]}"
+            )
+        return "\n".join(lines)
+
+    # ── hit recording ─────────────────────────────────────────────────────────
+
+    def record_hit(
+        self,
+        query: str,
+        binary: str,
+        va: int,
+        score: float = 1.0,
+        confirmed: bool = False,
+    ) -> None:
+        """Record that a pattern matched a function VA in a binary."""
+        p = self.get(query)
+        if p is None:
+            p = self.add(query)
+        # Avoid duplicate recording for same binary+va
+        for h in p.hits:
+            if h.binary == binary and h.va == va:
+                if confirmed and not h.confirmed:
+                    h.confirmed = True
+                return
+        p.hits.append(PatternHit(binary=binary, va=va, score=score, confirmed=confirmed))
+
+    # ── sweep ─────────────────────────────────────────────────────────────────
+
+    def sweep(
+        self,
+        searcher,
+        top_k: int = 5,
+        min_score: float = 0.3,
+        tags: Optional[List[str]] = None,
+    ) -> Dict[str, SweepResult]:
+        """
+        Run all patterns against a SemanticSearcher instance.
+
+        searcher: a SemanticSearcher with corpus already built (searcher.build_corpus())
+        top_k:    max results per pattern
+        min_score: minimum similarity threshold
+        tags:     if set, only run patterns matching these tags
+
+        Returns: {query: SweepResult}
+        """
+        results: Dict[str, SweepResult] = {}
+        patterns = self._patterns
+        if tags is not None:
+            patterns = [p for p in patterns if p.tag in tags]
+
+        for p in patterns:
+            try:
+                hits = searcher.query(p.query, top_k=top_k)
+            except Exception:
+                continue
+            hits = [h for h in hits if h.score >= min_score]
+            results[p.query] = SweepResult(
+                pattern=p.query,
+                tag=p.tag,
+                hits=[(h.va, h.score) for h in hits],
+            )
+
+        return results
+
+    def ingest_from_registry(self, reg) -> int:
+        """Pull confirmed findings from a FindingRegistry and add them as patterns.
+
+        Calls reg.export_patterns(), adds each to the library if not already present,
+        then saves. Returns count of new patterns added.
+
+        reg: a FindingRegistry instance — accepted as a duck-typed parameter so
+        pattern_library.py carries no hard import of finding_registry.py.
+
+        Usage:
+            from ablation.analyzers.finding_registry import FindingRegistry
+            from ablation.analyzers.pattern_library import PatternLibrary
+
+            reg = FindingRegistry()
+            pl  = PatternLibrary()
+            n   = pl.ingest_from_registry(reg)
+            print(f"{n} new patterns ingested from {reg.stats()['total']} findings")
+        """
+        with self._lock:
+            patterns = reg.export_patterns()
+            added = 0
+            for p in patterns:
+                if self.get(p["query"]) is None:
+                    self.add(p["query"], tag=p["tag"])
+                    added += 1
+            if added:
+                self.save()
+            return added
+
+    def fmt_sweep(
+        self,
+        results: Dict[str, SweepResult],
+        binary_name: str = "",
+    ) -> str:
+        """Format sweep results as a compact report."""
+        lines = [f"PatternLibrary sweep{': ' + binary_name if binary_name else ''}"]
+        for query, r in results.items():
+            if not r.hits:
+                continue
+            lines.append(f"\n  [{r.tag}] {query[:70]}")
+            for va, score in r.hits[:5]:
+                lines.append(f"    0x{va:x}  score={score:.3f}")
+        if not any(r.hits for r in results.values()):
+            lines.append("  (no hits above threshold)")
+        return "\n".join(lines)
+
+    # ── fuzzy byte similarity ─────────────────────────────────────────────────
+
+    @staticmethod
+    def fuzzy_similarity(bytes_a: bytes, bytes_b: bytes, method: str = 'tlsh') -> float:
+        """Return 0.0–1.0 similarity score between two byte sequences.
+
+        method='tlsh': uses the TLSH locality-sensitive hash (requires tlsh package).
+          TLSH is designed for 50-byte+ inputs. Returns 1.0 when the two inputs
+          are identical; approaches 0.0 as byte content diverges. TLSH score is
+          reported as a distance (lower = more similar); this method converts to
+          similarity as 1 - (distance / 300) clamped to [0, 1].
+
+        method='ssdeep': uses ssdeep context-triggered piecewise hashing (requires
+          ssdeep package). Returns block-size-normalized similarity in [0, 100]
+          converted to [0.0, 1.0].
+
+        method='byte': plain byte-level Jaccard similarity on 4-gram sets.
+          No external package needed; less sensitive to reordering.
+
+        Falls back gracefully to method='byte' if the requested library is absent.
+        """
+        if not bytes_a or not bytes_b:
+            return 0.0
+
+        if method == 'tlsh':
+            try:
+                import tlsh
+                h_a = tlsh.hash(bytes_a)
+                h_b = tlsh.hash(bytes_b)
+                if h_a in ('TNULL', '', None) or h_b in ('TNULL', '', None):
+                    return PatternLibrary.fuzzy_similarity(bytes_a, bytes_b, 'byte')
+                dist = tlsh.diff(h_a, h_b)
+                return max(0.0, 1.0 - dist / 300.0)
+            except ImportError:
+                return PatternLibrary.fuzzy_similarity(bytes_a, bytes_b, 'byte')
+
+        if method == 'ssdeep':
+            try:
+                import ssdeep
+                h_a = ssdeep.hash(bytes_a)
+                h_b = ssdeep.hash(bytes_b)
+                sim = ssdeep.compare(h_a, h_b)  # 0..100
+                return sim / 100.0
+            except ImportError:
+                return PatternLibrary.fuzzy_similarity(bytes_a, bytes_b, 'byte')
+
+        # Byte-level 4-gram Jaccard fallback
+        def ngrams(b: bytes, n: int = 4) -> set:
+            return {b[i:i + n] for i in range(len(b) - n + 1)}
+
+        set_a = ngrams(bytes_a)
+        set_b = ngrams(bytes_b)
+        if not set_a or not set_b:
+            return 0.0
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return intersection / union if union else 0.0

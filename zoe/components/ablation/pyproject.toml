@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ablation-tool"
+version = "2.95.0"
+description = "Semantic function matching for stripped firmware. No symbols. No source. No setup."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = [
+    "capstone>=5.0.1",
+    "numpy>=1.26.0",
+    "lief>=0.16.0",
+    "fastembed>=0.3.0",
+    "pyelftools>=0.29",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ablation-Tool/ablation"
+Issues = "https://github.com/Ablation-Tool/ablation/issues"
+Changelog = "https://github.com/Ablation-Tool/ablation/blob/main/docs/CHANGELOG.md"
+Source = "https://github.com/Ablation-Tool/ablation"
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.30.0"]
+finetune = ["sentence-transformers>=2.7.0"]
+binary = ["lief>=0.16.0"]
+bytecode = ["xdis>=6.0", "lz4>=4.0"]
+full = [
+    "anthropic>=0.30.0",
+    "angr>=9.2.90",
+    "bitstring<4.0",
+    "sentence-transformers>=2.7.0",
+    "lief>=0.16.0",
+    "xdis>=6.0",
+    "lz4>=4.0",
+]
+
+[project.scripts]
+ablation = "ablation.cli:main"
+ablation-sweep = "sweeps.base_sweep:main"
+ablation-search = "ablation.analyzers.finding_registry:_cli"
+ablation-taint = "ablation.analyzers.taint_tracker_x86:_cli"
+ablation-cfg = "ablation.analyzers.cfg_builder:_cli"
+ablation-sigs = "ablation.analyzers.sig_library:_cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--tb=short",
+]
+markers = [
+    "integration: marks tests that require external binary fixtures (skip with -m 'not integration')",
+]
+
+[tool.coverage.run]
+# TCL3 qualification scope: labeled taint engine modules only
+# These are the safety-qualified modules per ABLATION-STANDARDS.md §2.1
+# Coverage is measured only against these files, not the full ablation/analyzers tree
+include = [
+    "*/taint_tracker_arc_labeled.py",
+    "*/taint_tracker_arm32_labeled.py",
+    "*/taint_tracker_mips_labeled.py",
+    "*/taint_tracker_ppc_labeled.py",
+    "*/taint_tracker_riscv.py",
+    "*/taint_tracker_x86_labeled.py",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]
+
+[tool.setuptools.packages.find]
+include = ["ablation*", "sweeps*", "modules*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+"ablation" = ["profiles/*.yaml", "profiles/*.yml"]
+"ablation.data" = ["*.json", "*.md", "*.txt"]

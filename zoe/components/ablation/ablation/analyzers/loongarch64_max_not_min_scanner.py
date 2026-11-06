@@ -1,0 +1,804 @@
+"""
+loongarch64_max_not_min_scanner.py: detects the GCC 12.3.1.7 LoongArch64 min-to-max
+code-generation bug and checks whether the wrong value flows into a memory sink.
+
+GCC for LoongArch64 branchless min/max uses a four-instruction sequence:
+
+    sltu   Rcond, Ra, Rb      # Rcond = (Ra < Rb) unsigned
+    masknez Rtmp1, Rb, Rcond  # Rtmp1 = (Rcond != 0) ? Rb : 0   -- selects Rb when Ra<Rb
+    maskeqz Rtmp2, Ra, Rcond  # Rtmp2 = (Rcond == 0) ? Ra : 0   -- selects Ra when Ra>=Rb
+    or     Rout, Rtmp2, Rtmp1 # Rout  = Rtmp1 | Rtmp2
+
+That implements max(Ra, Rb). Correct min(Ra, Rb) swaps the masknez/maskeqz order.
+In GCC 12.3.1.7-1.tl4 the swap is missing, so every branchless min emits max.
+
+A second variant uses immediate-compare instructions (sltui/slti) with a constant
+bound loaded by addi.w/addi.d.  The combiner `or` may appear up to ~20 instructions
+after the mask pair because GCC schedules surrounding stores between them:
+
+    sltui  Rcond, Ra, imm+1   # Rcond = (Ra <= imm) [unsigned], i.e. Ra < imm+1
+    addi.w Rb, $zero, imm     # Rb = the clamped upper bound
+    maskeqz Rtmp2, Ra, Rcond  # (BUG: should be masknez)
+    masknez Rtmp1, Rb, Rcond  # (BUG: should be maskeqz)
+    ... intervening instructions ...
+    or     Rout, Rtmp2, Rtmp1 # result = max(Ra, imm) instead of min(Ra, imm)
+
+The scanner finds the four-instruction MAX sequence and checks whether Rout reaches
+a memory-sizing sink (memcpy/memmove count, read/fread count, malloc size) within a
+configurable lookahead window without being clobbered. A hit means the operation
+uses max(Ra,Rb) as a size where min(Ra,Rb) was intended -- a classic heap overread
+or heap overflow depending on which argument is the allocation size.
+
+Affected corpus: TencentOS Server 4.6 LoongArch64, GCC 12.3.1.7-1.tl4.
+Root CVE class: CWE-122 (heap-based buffer overflow) / CWE-125 (out-of-bounds read).
+
+Usage:
+    from ablation.analyzers.loongarch64_max_not_min_scanner import LA64MaxNotMinScanner
+
+    scanner = LA64MaxNotMinScanner.from_path('/path/to/binary')
+    findings = scanner.scan()
+    print(scanner.report(findings))
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    import lief
+    _LIEF_OK = True
+except ImportError:
+    _LIEF_OK = False
+
+
+# ---------------------------------------------------------------------------
+# Instruction encoding constants (from binutils 2.41 loongarch-opc.c)
+# 3R format: bits[31:15] = opcode, bits[14:10] = rk, bits[9:5] = rj, bits[4:0] = rd
+# ---------------------------------------------------------------------------
+
+_MATCH_SLT     = 0x00120000   # slt  (signed compare) — smin variant of GCC bug
+_MATCH_SLTU    = 0x00128000   # sltu (unsigned compare) — umin variant
+_MATCH_MASKEQZ = 0x00130000
+_MATCH_MASKNEZ = 0x00138000
+_MATCH_OR      = 0x00150000
+_MASK_3R       = 0xffff8000   # bits[31:15]
+
+# 2RI12 format: bits[31:22] = opcode (10 bits), bits[21:10] = imm12,
+#               bits[9:5] = rj, bits[4:0] = rd
+_MASK_2RI12  = 0xffc00000
+_MATCH_SLTUI = 0x02400000  # sltui Rd, Rj, ui12 — unsigned imm compare  (9  << 22)
+_MATCH_SLTI  = 0x02000000  # slti  Rd, Rj, si12 — signed imm compare    (8  << 22)
+_MATCH_ADDIW = 0x02800000  # addi.w Rd, Rj, si12                         (10 << 22)
+_MATCH_ADDID = 0x02c00000  # addi.d Rd, Rj, si12                         (11 << 22)
+
+# Max instructions past masknez to scan for the combining `or` in the sltui variant.
+# O-024 (libcrypto OCB helper) has 5 intervening instructions; 20 gives headroom.
+_SLTUI_OR_LOOKAHEAD = 20
+
+_MATCH_BL      = 0x54000000
+_MASK_BL       = 0xfc000000   # bl offs26
+
+_MATCH_JIRL    = 0x4c000000
+_MASK_JIRL     = 0xfc000000
+
+_MATCH_MULD    = 0x001d8000   # mul.d Rd, Rj, Rk (3R format)
+
+# Comparison branches used as capacity guards in Rust Vec-growth: blt/bge/bltu/bgeu.
+# When >= 2 of these appear in the lookahead window before a memset sink the pattern
+# is Rust Vec-resize (intentional max(cap*2, len+needed) → memset), not an overflow.
+_VEC_GUARD_TOP6: frozenset = frozenset({0x18, 0x19, 0x1a, 0x1b})  # BLT BGE BLTU BGEU
+_VEC_GUARD_THRESHOLD = 2
+
+# ---------------------------------------------------------------------------
+# Dead-register kill tables (Cifuentes §5.4.1 liveness analysis).
+# LoongArch64 stores and conditional branches use bits[4:0] as a SOURCE
+# register, NOT a destination.  Every other instruction class writes rd.
+# ---------------------------------------------------------------------------
+
+# 2RI12-format stores: bits[31:22] opcode  (ST.B / ST.H / ST.W / ST.D)
+_STORE_OP22: frozenset = frozenset({
+    0x29c00000 >> 22,   # ST.B
+    0x2a000000 >> 22,   # ST.H
+    0x2a400000 >> 22,   # ST.W
+    0x2a800000 >> 22,   # ST.D
+    0x2b000000 >> 22,   # FST.S
+    0x2b400000 >> 22,   # FST.D
+})
+
+# 3R-format indexed stores: bits[31:15] opcode  (STX.B / STX.H / STX.W / STX.D)
+_STOREX_OP15: frozenset = frozenset({
+    0x38100000 >> 15,   # STX.B
+    0x38108000 >> 15,   # STX.H
+    0x38110000 >> 15,   # STX.W
+    0x38118000 >> 15,   # STX.D
+    0x38400000 >> 15,   # STPTR.W
+    0x38408000 >> 15,   # STPTR.D
+})
+
+# Conditional branches: bits[31:26] opcode — bits[4:0] are part of the
+# offset immediate or a source register, never a destination.
+_BRANCH_TOP6: frozenset = frozenset({
+    0x10,  # BEQZ
+    0x11,  # BNEZ
+    0x14,  # B
+    0x15,  # BL   (handled before we reach the kill check, but included for safety)
+    0x16,  # BEQ
+    0x17,  # BNE
+    0x18,  # BLT
+    0x19,  # BGE
+    0x1a,  # BLTU
+    0x1b,  # BGEU
+})
+
+# OR instruction used as a register move: or Rd, Rj, $zero (rk=0)
+_MASK_OR_MOVE  = 0xffff83e0   # bits[31:15] + bits[14:10] (rk forced to 0)
+_MATCH_OR_MOVE = 0x00150000   # rk=0 encodes as bits[14:10]=00000
+
+# Argument registers (lp64 ABI)
+_ARG_REGS: Set[int] = {4, 5, 6, 7, 8, 9, 10, 11}  # $a0-$a7 (r4-r11)
+_A0, _A1, _A2 = 4, 5, 6  # memcpy(dst=$a0, src=$a1, count=$a2); read(fd=$a0, buf=$a1, n=$a2)
+
+
+def _rd(word: int) -> int:  return  word        & 0x1f
+def _rj(word: int) -> int:  return (word >>  5) & 0x1f
+def _rk(word: int) -> int:  return (word >> 10) & 0x1f
+
+
+def _bl_target(word: int, va: int) -> int:
+    """Resolve absolute target VA for a bl instruction."""
+    # imm26: upper 10 bits are word[9:0], lower 16 bits are word[25:10]
+    imm26 = ((word & 0x3ff) << 16) | ((word >> 10) & 0xffff)
+    if imm26 & (1 << 25):
+        imm26 |= (-1 << 26)
+    return (va + (imm26 << 2)) & 0xffffffffffffffff
+
+
+# ---------------------------------------------------------------------------
+# Sink descriptors
+# Keyed by canonical PLT symbol name; value is the argument register index
+# (0-based into the lp64 integer argument registers $a0-$a7) that carries
+# the dangerous size value produced by the max-not-min bug.
+# ---------------------------------------------------------------------------
+
+_SINKS: Dict[str, Tuple[int, str]] = {
+    # (arg_reg_number, human label)
+    "memcpy":          (_A2, "count"),
+    "memmove":         (_A2, "count"),
+    "memset":          (_A2, "count"),
+    "__memcpy":        (_A2, "count"),
+    "__memmove":       (_A2, "count"),
+    "read":            (_A2, "nbytes"),
+    "pread":           (_A2, "nbytes"),
+    "pread64":         (_A2, "nbytes"),
+    "fread":           (_A2, "nmemb"),
+    "fgets":           (_A1, "size"),
+    "recv":            (_A2, "len"),
+    "recvfrom":        (_A2, "len"),
+    "malloc":          (_A0, "size"),
+    "calloc":          (_A0, "nmemb"),
+    "realloc":         (_A1, "size"),
+    "posix_memalign":  (_A2, "size"),
+    "kmalloc":         (_A0, "size"),
+    "vmalloc":         (_A0, "size"),
+    "kzalloc":         (_A0, "size"),
+    "__kmalloc":       (_A0, "size"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Finding record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LA64MaxNotMinFinding:
+    func_va:    int         # VA of the enclosing function (0 if unknown)
+    pattern_va: int         # VA of the slt/sltu instruction (start of 4-insn sequence)
+    result_reg: int         # register number of the or result
+    result_name: str        # ABI name of result_reg
+    sink_va:    int         # VA of the bl to the sink
+    sink_name:  str         # PLT symbol name
+    sink_arg:   str         # argument label ("count", "size", etc.)
+    context:    str = ""    # disassembly snippet
+    fp_class:   str = ""    # "": real finding; "vec_growth": ELIMINATED (Rust Vec-resize);
+                            # "copy_limit": PLAUSIBLE_LOW (max*elem_size via mul.d)
+    compare_op: str = "sltu"  # "sltu" (unsigned / umin bug) or "slt" (signed / smin bug)
+
+    def __str__(self) -> str:
+        tag = f"  [{self.fp_class.upper()}]" if self.fp_class else ""
+        return (f"LA64_MAX_NOT_MIN  pattern@0x{self.pattern_va:x}"
+                f"  {self.result_name} -> {self.sink_name}({self.sink_arg})"
+                f"@0x{self.sink_va:x}"
+                + (f"  [{self.context}]" if self.context else "")
+                + tag)
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+
+class LA64MaxNotMinScanner:
+    """
+    Scans a LoongArch64 ELF or PE32+ (UEFI DXE) binary for the GCC 12.3.1.7
+    max-not-min sequence and confirms whether the result reaches a sink.
+
+    ELF mode  : from_path(elf)     -> scan() -> report(findings)
+    PE32+ mode: from_pe32plus(data) -> scan() -> report(findings)
+
+    In PE32+ mode, PLT resolution is impossible (no GOT/PLT; external calls go
+    through EFI Boot Services Table pointers via JIRL).  Instead, any BL or JIRL
+    where the max-not-min result is live in an argument register ($a0-$a7) at
+    call time is reported with sink_name "<direct>" or "<indirect>".
+    """
+
+    # How far to look past the `or` instruction for a sink call.
+    LOOKAHEAD = 20
+
+    def __init__(self, data: bytes, base: int, plt: Dict[int, str],
+                 text_va: int, text_size: int, is_rel: bool = False,
+                 pe32plus: bool = False):
+        self._data     = data
+        self._base     = base
+        self._plt      = plt
+        self._text_va  = text_va
+        self._text_sz  = text_size
+        self._is_rel   = is_rel    # True for ET_REL (kernel modules): plt keyed by file offset
+        self._pe32plus = pe32plus  # True for UEFI PE32+: arg-register feed detection only
+
+    @classmethod
+    def from_path(cls, path: str) -> 'LA64MaxNotMinScanner':
+        data = Path(path).read_bytes()
+        base     = 0
+        plt:     Dict[int, str] = {}
+        text_va  = 0
+        text_sz  = len(data)
+
+        _is_rel_flag = False
+        if _LIEF_OK:
+            try:
+                binary = lief.parse(data)
+                if isinstance(binary, lief.ELF.Binary):
+                    _is_rel_flag = (int(binary.header.file_type) == 1)  # ET_REL = 1
+                    is_rel = _is_rel_flag
+
+                    if is_rel:
+                        # ET_REL (kernel module): sections have no load VA.
+                        # Use file offset as the "VA" so that _words_at(offset, n)
+                        # computes off = offset - base = offset - offset = 0 from section start.
+                        # base stays 0; text_va = section file offset.
+                        text_sec = binary.get_section('.text')
+                        if text_sec:
+                            text_va = int(text_sec.offset)
+                            text_sz = int(text_sec.size)
+
+                        # Build sink map from .rela.text: relocations that target external
+                        # symbols (UND) are calls to kernel exports like kmalloc/memcpy.
+                        # RELA entry for a BL is placed at the BL instruction's file offset.
+                        rela_text = binary.get_section('.rela.text')
+                        if rela_text:
+                            rela_data = bytes(rela_text.content)
+                            entry_size = 24  # Rela64
+                            text_file_off = int(text_sec.offset) if text_sec else 0
+                            syms = list(binary.symbols)
+                            for i in range(len(rela_data) // entry_size):
+                                off = i * entry_size
+                                r_offset = struct.unpack_from('<Q', rela_data, off)[0]
+                                r_info   = struct.unpack_from('<Q', rela_data, off + 8)[0]
+                                sym_idx  = r_info >> 32
+                                r_type   = r_info & 0xffffffff
+                                # R_LARCH_B26 = 66 (0x42) — BL relocation type for function calls
+                                if r_type != 66:
+                                    continue
+                                try:
+                                    sym = syms[sym_idx]
+                                    name = sym.name or ''
+                                except Exception:
+                                    name = ''
+                                if name and name in _SINKS:
+                                    # r_offset is the offset within .text where the BL lives
+                                    call_file_off = text_file_off + r_offset
+                                    plt[call_file_off] = name
+                    else:
+                        base = binary.imagebase
+                        text_sec = binary.get_section('.text')
+                        if text_sec:
+                            text_va = int(text_sec.virtual_address)
+                            text_sz = int(text_sec.size)
+
+                        # LoongArch64 PLT uses 2-slot (32-byte) header; stubs start at index 2.
+                        # Each PLT stub is 16 bytes (4 instructions: pcaddu12i + ld.d + jirl + nop).
+                        plt_sec  = binary.get_section('.plt')
+                        rela_plt = binary.get_section('.rela.plt')
+                        if plt_sec and rela_plt:
+                            plt_base = int(plt_sec.virtual_address)
+                            rela_data = bytes(rela_plt.content)
+                            entry_size = 24
+                            for idx in range(len(rela_data) // entry_size):
+                                off = idx * entry_size
+                                r_info = struct.unpack_from('<Q', rela_data, off + 8)[0]
+                                sym_idx = r_info >> 32
+                                try:
+                                    sym = binary.dynamic_symbols[sym_idx]
+                                    name = sym.name or ''
+                                except Exception:
+                                    name = ''
+                                if name:
+                                    stub_va = plt_base + (2 + idx) * 16
+                                    plt[stub_va] = name
+            except Exception:
+                pass
+
+        return cls(data, base, plt, text_va, text_sz, is_rel=_is_rel_flag)
+
+    @classmethod
+    def from_pe32plus(cls, data: bytes, image_base: int = 0) -> 'LA64MaxNotMinScanner':
+        """
+        Load a PE32+ (UEFI DXE/PEIM) binary for scanning.
+
+        Parses the PE32+ section table to find the first code section (.text),
+        then sets up the VA→file-offset bias so the standard _words_at() path
+        works without modification.
+
+        Because PE32+ has no PLT/GOT, sink names cannot be resolved.  The
+        scanner instead reports any BL/JIRL call site where the max-not-min
+        result is live in an argument register at call time.  Confirm sinks
+        manually: AllocatePool is always JIRL through the Boot Services Table;
+        CopyMem/SetMem are similar.
+
+        Parameters
+        ----------
+        data        : raw file bytes of the .efi module
+        image_base  : preferred load address reported in the optional header
+                      (pass 0 to use the on-disk section layout directly)
+        """
+        text_va  = 0
+        text_sz  = 0
+        # bias = image_base + vaddr - raw_off  so that off = va - bias = raw_off + delta
+        base     = 0
+
+        found_text = False
+        if len(data) >= 0x40:
+            pe_off = struct.unpack_from('<I', data, 0x3c)[0]
+            if pe_off + 24 <= len(data) and data[pe_off:pe_off+4] == b'PE\x00\x00':
+                num_sections = struct.unpack_from('<H', data, pe_off + 6)[0]
+                opt_size     = struct.unpack_from('<H', data, pe_off + 20)[0]
+                sect_off     = pe_off + 24 + opt_size
+                for i in range(num_sections):
+                    s = sect_off + i * 40
+                    if s + 40 > len(data):
+                        break
+                    chars   = struct.unpack_from('<I', data, s + 36)[0]
+                    # IMAGE_SCN_CNT_CODE (0x20) marks executable sections
+                    if chars & 0x20:
+                        vsize   = struct.unpack_from('<I', data, s + 8)[0]
+                        vaddr   = struct.unpack_from('<I', data, s + 12)[0]
+                        raw_sz  = struct.unpack_from('<I', data, s + 16)[0]
+                        raw_off = struct.unpack_from('<I', data, s + 20)[0]
+                        text_va  = image_base + vaddr
+                        text_sz  = min(vsize, raw_sz)
+                        # bias: _words_at(va) computes off = va - base
+                        # we want off = raw_off when va = text_va
+                        base     = text_va - raw_off
+                        found_text = True
+                        break
+
+        if not found_text:
+            # Fallback: treat the whole file as a flat .text region at VA 0
+            text_va = 0
+            text_sz = len(data)
+            base    = 0
+
+        return cls(data, base, {}, text_va, text_sz, is_rel=False, pe32plus=True)
+
+    @classmethod
+    def from_system_map(cls, path: str, sysmap_path: str) -> 'LA64MaxNotMinScanner':
+        """
+        Load a vmlinux (or similar fully-linked kernel ELF) for scanning.
+
+        Kernel images define memory sinks internally — there is no .rela.plt
+        section.  This constructor reads System.map to build the plt dict from
+        T/t/W/w symbols whose names appear in _SINKS, then delegates to the
+        standard scan() / _check_lookahead() path unchanged.
+
+        System.map format (one entry per line):
+            <hex_va> <type> <name>
+        where <type> is one of: T t W w (text/weak symbols — function bodies).
+
+        Parameters
+        ----------
+        path      : path to the vmlinux ELF (may be stripped)
+        sysmap_path: path to System.map (e.g. /boot/System.map-6.6.119)
+        """
+        data = Path(path).read_bytes()
+        base    = 0
+        text_va = 0
+        text_sz = len(data)
+
+        if _LIEF_OK:
+            try:
+                binary = lief.parse(data)
+                if isinstance(binary, lief.ELF.Binary):
+                    base = binary.imagebase
+                    sec = binary.get_section('.text')
+                    if sec:
+                        text_va = int(sec.virtual_address)
+                        text_sz = int(sec.size)
+            except Exception:
+                pass
+
+        plt: Dict[int, str] = {}
+        with open(sysmap_path) as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3 or parts[1] not in ('T', 't', 'W', 'w'):
+                    continue
+                name = parts[2]
+                if name in _SINKS:
+                    try:
+                        plt[int(parts[0], 16)] = name
+                    except ValueError:
+                        continue
+
+        return cls(data, base, plt, text_va, text_sz, is_rel=False)
+
+    # ------------------------------------------------------------------
+
+    def _words_at(self, va: int, count: int) -> Optional[List[int]]:
+        """Read `count` 32-bit LE words starting at VA. Returns None on bounds error."""
+        off = va - self._base
+        need = count * 4
+        if off < 0 or off + need > len(self._data):
+            return None
+        return list(struct.unpack_from(f'<{count}I', self._data, off))
+
+    def _word_at(self, va: int) -> Optional[int]:
+        words = self._words_at(va, 1)
+        return words[0] if words else None
+
+    # ------------------------------------------------------------------
+
+    def scan(self) -> List[LA64MaxNotMinFinding]:
+        """
+        Slide a 4-word window over .text looking for the MAX sequence, then
+        confirm the or-result reaches a sink within LOOKAHEAD instructions.
+        """
+        findings: List[LA64MaxNotMinFinding] = []
+        va = self._text_va
+        end_va = self._text_va + self._text_sz - 12  # need at least 4 words
+
+        while va < end_va:
+            words = self._words_at(va, 4)
+            if words is None:
+                break
+
+            w0, w1, w2, w3 = words
+
+            # Instruction 0: sltu Rcond, Ra, Rb  OR  slt Rcond, Ra, Rb
+            # GCC 12.3.1.7 inverts both smin (slt) and umin (sltu) variants.
+            if (w0 & _MASK_3R) not in (_MATCH_SLTU, _MATCH_SLT):
+                # 2RI12 sltui/slti immediate-compare variant (O-024 class)
+                if (w0 & _MASK_2RI12) in (_MATCH_SLTUI, _MATCH_SLTI):
+                    f = self._check_sltui_variant(va, words)
+                    if f:
+                        findings.append(f)
+                va += 4
+                continue
+
+            rcond = _rd(w0)
+            ra    = _rj(w0)
+            rb    = _rk(w0)
+
+            # Instruction 1: masknez Rtmp1, Rb, Rcond   (MAX path: selects Rb when Ra<Rb)
+            if (w1 & _MASK_3R) != _MATCH_MASKNEZ:
+                va += 4
+                continue
+            if _rj(w1) != rb or _rk(w1) != rcond:
+                va += 4
+                continue
+            rtmp1 = _rd(w1)
+
+            # Instruction 2: maskeqz Rtmp2, Ra, Rcond   (MAX path: selects Ra when Ra>=Rb)
+            if (w2 & _MASK_3R) != _MATCH_MASKEQZ:
+                va += 4
+                continue
+            if _rj(w2) != ra or _rk(w2) != rcond:
+                va += 4
+                continue
+            rtmp2 = _rd(w2)
+
+            # Instruction 3: or Rout, Rtmp2, Rtmp1  (or commuted: Rtmp1, Rtmp2)
+            # OR is commutative; GCC may emit either operand order depending on
+            # register allocation.  Use set equality to accept both.
+            if (w3 & _MASK_3R) != _MATCH_OR:
+                va += 4
+                continue
+            if {_rj(w3), _rk(w3)} != {rtmp1, rtmp2}:
+                va += 4
+                continue
+            rout = _rd(w3)
+
+            # Found the MAX sequence. Now check the lookahead window for a sink.
+            compare_op = "slt" if (w0 & _MASK_3R) == _MATCH_SLT else "sltu"
+            hit = self._check_lookahead(va + 16, rout)
+            if hit:
+                sink_va, sink_name, sink_arg, fp_class = hit
+                ctx = self._context_snippet(va)
+                findings.append(LA64MaxNotMinFinding(
+                    func_va     = 0,  # not needed for triage; callers can fill in
+                    pattern_va  = va,
+                    result_reg  = rout,
+                    result_name = self._reg_name(rout),
+                    sink_va     = sink_va,
+                    sink_name   = sink_name,
+                    sink_arg    = sink_arg,
+                    context     = ctx,
+                    fp_class    = fp_class,
+                    compare_op  = compare_op,
+                ))
+
+            va += 4
+
+        return findings
+
+    def _check_lookahead(
+        self, start_va: int, rout: int
+    ) -> Optional[Tuple[int, str, str, str]]:
+        """
+        Walk up to LOOKAHEAD instructions from start_va. Track register rout.
+        Return (sink_va, sym, arg_label, fp_class) if rout flows into a sink arg, else None.
+
+        fp_class values:
+          ""            -- real finding (confirm)
+          "vec_growth"  -- ELIMINATED: memset sink + >=2 BLT/BGE/BLTU/BGEU guards in window
+          "copy_limit"  -- PLAUSIBLE_LOW: max-not-min result passes through mul.d before sink
+        """
+        live:               Set[int] = {rout}
+        guard_branch_count: int      = 0      # BLT/BGE/BLTU/BGEU seen in window
+        is_copy_limit:      bool     = False  # mul.d with live operand seen
+
+        for i in range(self.LOOKAHEAD):
+            va = start_va + i * 4
+            word = self._word_at(va)
+            if word is None:
+                break
+
+            # BL instruction
+            if (word & _MASK_BL) == _MATCH_BL:
+                if self._pe32plus:
+                    live_args = live & _ARG_REGS
+                    if live_args:
+                        arg_reg = min(live_args)
+                        fp_class = "copy_limit" if is_copy_limit else ""
+                        return (va, "<direct>", self._reg_name(arg_reg), fp_class)
+                else:
+                    # ET_REL: plt keyed by call-site file offset; ET_DYN/EXEC: PLT stub VA
+                    target = va if self._is_rel else _bl_target(word, va)
+                    sym = self._plt.get(target)
+                    if sym and sym in _SINKS:
+                        expected_reg, arg_label = _SINKS[sym]
+                        if expected_reg in live:
+                            if sym in ("memset", "__memset") and guard_branch_count >= _VEC_GUARD_THRESHOLD:
+                                fp_class = "vec_growth"
+                            elif is_copy_limit:
+                                fp_class = "copy_limit"
+                            else:
+                                fp_class = ""
+                            return (va, sym, arg_label, fp_class)
+                # Calls to unknown functions clobber $a0-$a7; reset argument registers
+                live -= _ARG_REGS
+                continue
+
+            # JIRL indirect call (rd != $zero means return address is saved -> it is a call)
+            if (word & _MASK_JIRL) == _MATCH_JIRL and _rd(word) != 0:
+                if self._pe32plus:
+                    live_args = live & _ARG_REGS
+                    if live_args:
+                        arg_reg = min(live_args)
+                        fp_class = "copy_limit" if is_copy_limit else ""
+                        return (va, "<indirect>", self._reg_name(arg_reg), fp_class)
+                live -= _ARG_REGS
+                continue
+
+            top6 = word >> 26
+
+            # BLT/BGE/BLTU/BGEU: capacity-guard branches for Vec-growth detection
+            if top6 in _VEC_GUARD_TOP6:
+                guard_branch_count += 1
+                continue
+
+            # mul.d Rdst, Rj, Rk -- propagate taint through multiply; tag copy_limit
+            if (word & _MASK_3R) == _MATCH_MULD:
+                if _rj(word) in live or _rk(word) in live:
+                    live.add(_rd(word))
+                    is_copy_limit = True
+                continue
+
+            # or Rdst, Rsrc, $zero  (register move)
+            if (word & _MASK_3R) == _MATCH_OR and _rk(word) == 0:
+                if _rj(word) in live:
+                    live.add(_rd(word))
+                continue
+
+            # addi.d Rdst, Rsrc, 0  (zero-immediate add = move)
+            if (word & _MASK_2RI12) == _MATCH_ADDID:
+                si12 = (word >> 10) & 0xfff
+                if si12 == 0 and _rj(word) in live:
+                    live.add(_rd(word))
+                continue
+
+            # Dead-register kill (Cifuentes §5.4.1): if this instruction writes rd,
+            # the max-not-min value is no longer live in that register.
+            # Stores and conditional branches use bits[4:0] as source/immediate, not dest.
+            rd = _rd(word)
+            if rd != 0 and rd in live:
+                op22 = word >> 22
+                op15 = word >> 15
+                if top6 not in _BRANCH_TOP6 and op22 not in _STORE_OP22 and op15 not in _STOREX_OP15:
+                    live.discard(rd)
+
+        return None
+
+    def _check_sltui_variant(
+        self, va: int, words: List[int]
+    ) -> Optional[LA64MaxNotMinFinding]:
+        """
+        Detect the 2RI12 immediate-compare variant of the GCC max-not-min bug.
+
+        Pattern (O-024 canonical):
+            [0] sltui/slti  Rcond, Ra, imm    -- Rcond = (Ra < imm)
+            [1] addi.w/addi.d Rb, $zero, imm-1 -- load bound constant
+            [2] maskeqz/masknez Rtmp2, Ra, Rcond
+            [3] masknez/maskeqz Rtmp1, Rb, Rcond  (opposite of [2])
+            ... up to _SLTUI_OR_LOOKAHEAD (20) instructions ...
+            [N] or Rout, Rtmp1, Rtmp2          -- combining or (operands commutative)
+
+        Returns a finding if the combiner `or` is reached within _SLTUI_OR_LOOKAHEAD
+        instructions of [3] and Rout flows into a sink, or None otherwise.
+        """
+        w0, w1, w2, w3 = words
+
+        # [0] sltui or slti: 2RI12 format, opcode in bits[31:22]
+        cmp_mask = w0 & _MASK_2RI12
+        # (caller already checked this; guard is here for safety)
+        if cmp_mask not in (_MATCH_SLTUI, _MATCH_SLTI):
+            return None
+        rcond = _rd(w0)
+        ra    = _rj(w0)
+
+        # [1] addi.w or addi.d loading from $zero — synthesises the bound constant
+        addi_mask = w1 & _MASK_2RI12
+        if addi_mask not in (_MATCH_ADDIW, _MATCH_ADDID):
+            return None
+        if _rj(w1) != 0:   # must be addi.{w,d} Rb, $zero, imm
+            return None
+        rb = _rd(w1)
+        if rb == 0:         # writing to $zero is a nop, not a real load
+            return None
+
+        # [2] maskeqz or masknez with rk == rcond
+        if (w2 & _MASK_3R) not in (_MATCH_MASKEQZ, _MATCH_MASKNEZ):
+            return None
+        if _rk(w2) != rcond:
+            return None
+        rtmp2 = _rd(w2)
+
+        # [3] the opposite mask instruction with rk == rcond
+        expected_mask3 = _MATCH_MASKNEZ if (w2 & _MASK_3R) == _MATCH_MASKEQZ else _MATCH_MASKEQZ
+        if (w3 & _MASK_3R) != expected_mask3:
+            return None
+        if _rk(w3) != rcond:
+            return None
+        rtmp1 = _rd(w3)
+
+        # The two mask instructions must select between Ra and Rb
+        # (set equality handles both maskeqz-first and masknez-first orderings).
+        if {_rj(w2), _rj(w3)} != {ra, rb}:
+            return None
+
+        # GCC bug orientation check: masknez must have rj == rb (the BOUND register).
+        # The GCC bug inverts min(a,b) to max(a,b) by keeping the BOUND when a<b.
+        # masknez(Rb,cond) does this (keeps Rb=bound when cond!=0 i.e. a<b).
+        # Correct min code has masknez(Ra,cond) instead — skip that as a false positive.
+        masknez_w = w2 if (w2 & _MASK_3R) == _MATCH_MASKNEZ else w3
+        if _rj(masknez_w) != rb:
+            return None
+
+        # Scan for the combining `or` up to _SLTUI_OR_LOOKAHEAD instructions past [3].
+        target_pair = frozenset({rtmp1, rtmp2})
+        or_va: Optional[int] = None
+        rout:  Optional[int] = None
+
+        for i in range(_SLTUI_OR_LOOKAHEAD):
+            scan_va = va + 16 + i * 4  # first candidate is [4], i.e., va+16
+            word = self._word_at(scan_va)
+            if word is None:
+                break
+
+            if (word & _MASK_3R) == _MATCH_OR:
+                if frozenset({_rj(word), _rk(word)}) == target_pair:
+                    or_va = scan_va
+                    rout  = _rd(word)
+                    break
+                # A different `or` that overwrites rtmp1 or rtmp2 breaks the chain.
+                if _rd(word) in target_pair:
+                    break
+                continue
+
+            # Dead-register kill (Cifuentes §5.4.1): store and branch instructions
+            # encode bits[4:0] as source/offset, not destination — skip them.
+            rd_w = _rd(word)
+            if rd_w in target_pair and rd_w != 0:
+                top6 = word >> 26
+                op22 = word >> 22
+                op15 = word >> 15
+                if (top6 not in _BRANCH_TOP6
+                        and op22 not in _STORE_OP22
+                        and op15 not in _STOREX_OP15):
+                    break  # rtmp1 or rtmp2 clobbered before the combining `or`
+
+        if or_va is None or rout is None:
+            return None
+
+        compare_op = "sltui" if cmp_mask == _MATCH_SLTUI else "slti"
+        hit = self._check_lookahead(or_va + 4, rout)
+        if not hit:
+            return None
+
+        sink_va, sink_name, sink_arg, fp_class = hit
+        ctx = self._context_snippet(va)
+        return LA64MaxNotMinFinding(
+            func_va     = 0,
+            pattern_va  = va,
+            result_reg  = rout,
+            result_name = self._reg_name(rout),
+            sink_va     = sink_va,
+            sink_name   = sink_name,
+            sink_arg    = sink_arg,
+            context     = ctx,
+            fp_class    = fp_class,
+            compare_op  = compare_op,
+        )
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reg_name(reg: int) -> str:
+        _NAMES = (
+            "$zero", "$ra",  "$tp",  "$sp",  "$a0",  "$a1",  "$a2",  "$a3",
+            "$a4",   "$a5",  "$a6",  "$a7",  "$t0",  "$t1",  "$t2",  "$t3",
+            "$t4",   "$t5",  "$t6",  "$t7",  "$t8",  "$r21", "$fp",  "$s0",
+            "$s1",   "$s2",  "$s3",  "$s4",  "$s5",  "$s6",  "$s7",  "$s8",
+        )
+        return _NAMES[reg] if 0 <= reg < 32 else f"$r{reg}"
+
+    def _context_snippet(self, va: int) -> str:
+        """Return a compact hex representation of the 4-instruction sequence."""
+        words = self._words_at(va, 4)
+        if not words:
+            return ""
+        return " ".join(f"{w:08x}" for w in words)
+
+    # ------------------------------------------------------------------
+
+    def report(self, findings: List[LA64MaxNotMinFinding]) -> str:
+        if not findings:
+            return "LA64 max-not-min scan: no sink-proximate patterns found."
+        real       = [f for f in findings if not f.fp_class]
+        copy_limit = [f for f in findings if f.fp_class == "copy_limit"]
+        vec_growth = [f for f in findings if f.fp_class == "vec_growth"]
+        summary = f"LA64 max-not-min scan: {len(findings)} finding(s)"
+        parts = []
+        if real:
+            parts.append(f"{len(real)} CONFIRM")
+        if copy_limit:
+            parts.append(f"{len(copy_limit)} COPY_LIMIT (PLAUSIBLE_LOW)")
+        if vec_growth:
+            parts.append(f"{len(vec_growth)} ELIMINATED (vec_growth)")
+        if parts:
+            summary += "  [" + ", ".join(parts) + "]"
+        lines = [summary, "=" * 72]
+        for f in findings:
+            lines.append(str(f))
+        return "\n".join(lines)

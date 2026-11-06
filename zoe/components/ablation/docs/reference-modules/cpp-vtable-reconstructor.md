@@ -1,0 +1,291 @@
+<a id="c-vtable-reconstructor"></a>
+# C++ Call Recovery
+
+Standalone three-layer pipeline for reconstructing C++ virtual dispatch from any ELF
+binary. No IDA license. No relocation requirement. Runs at sweep scale.
+
+---
+
+## Why this exists
+
+Three things were missing from Ablation's vtable tooling before v2.41.0:
+
+**1. Architecture coverage.** `ELFVtableReconstructor` was x86-64 only. `VtableResolver`
+was ARM64 only. Neither ran on LoongArch64, PPC64, MIPS, RISC-V, or any other arch. Any
+firmware RE on a non-x86/ARM target had no vtable discovery at all.
+
+**2. Slot naming.** Even on supported arches, the existing modules returned a numbered
+array: `slot_3 → 0x13450`. No names. The Hex-Rays decompiler then showed
+`alg_vtbl[3](...)` with no indication that slot 3 is `modexp`. You had to manually trace
+every slot to figure out what it did before you could start analysis.
+
+**3. Type propagation friction.** Even after naming slots by hand, setting the struct type
+in IDA required calling `set_type` on the producer function return and then hunting down
+every consumer local in every caller one variable at a time to propagate the type
+through the decompiler. There was no batch automation for this.
+
+`CppVtableReconstructorAnalyzer` resolves all three with a single Python call:
+
+1. VtableScanner: finds vtables in any ELF using RELA relocations (dynamic) or
+ code-pointer scanning (static)
+2. VtableNamer: names each slot from export symbols, BinaryContext function names,
+ string literals, and callee patterns
+3. CppTypeTracker: finds every call site that dispatches through any named slot;
+ groups by enclosing function
+
+Output: a JSON-serialisable result object **and** an IDAPython script that emits
+`idc.parse_decls()` + `idc.set_cmt()` for the full producer→consumer chain in one pass.
+
+---
+
+## Module
+
+**File:** `ablation/analyzers/cpp_vtable_reconstructor.py`
+
+**Relationship to existing vtable modules:**
+
+| Module | Arch | Discovery | Naming | Call sites | IDAPython |
+|---|---|---|---|---|---|
+| `ELFVtableReconstructor` | x86-64 only | `.rela.dyn` by class name or VA | ✗ | ✗ | ✗ |
+| `VtableResolver` | ARM64 | `.data.rel.ro` RELATIVE relocs | ✗ | BLR sites | ✗ |
+| `VtableDispatchScanner` | x86-64 | ✗ takes slot map | ✗ | `call [reg+disp]` | ✗ |
+| **`CppVtableReconstructorAnalyzer`** | **any ELF** | **RELA + byte scan** | **✓** | **x86-64 + ARM64** | **✓** |
+
+---
+
+## Usage
+
+```python
+from modules.cpp_vtable_reconstructor import CppVtableReconstructorAnalyzer
+
+# Minimum viable (no BinaryContext)
+analyzer = CppVtableReconstructorAnalyzer.from_path('/path/to/lib.so')
+result   = analyzer.scan()
+
+print(CppVtableReconstructorAnalyzer.report(result))
+print(CppVtableReconstructorAnalyzer.emit_ida_script(
+          result.vtables, result.propagation))
+
+# Full: with BinaryContext for slot naming
+ctx      = BinaryContext.load_or_build('/path/to/lib.so')
+analyzer = CppVtableReconstructorAnalyzer.from_context(ctx)
+result   = analyzer.scan()
+```
+
+---
+
+## Three-layer pipeline
+
+### Layer 1: `scan_vtables(min_slots=3)`
+
+Extracts vtable specs from the binary.
+
+**Primary method RELA-based:** iterates all ELF relocations and collects entries whose
+addend points into an executable section a virtual function and whose address is in a
+data section a vtable slot. Groups consecutive 8-byte-aligned entries into runs of
+`min_slots` or more; each run is one vtable.
+
+This approach works for all dynamic ELFs regardless of architecture: x86-64, ARM64,
+LoongArch64, PPC64, etc. It requires no knowledge of the relocation type.
+
+**Fallback method byte scan:** when no RELA runs are found (static binary or non-PIE
+executable), scans `.rodata` / `.data.rel.ro` / `.data` for runs of 8-byte values that
+point into `.text`. Correct for PIE ELF where `virtual_address == file_offset` for all
+sections.
+
+Each `VtableSpec` records:
+- `va`: the vtable pointer address vfunc[0], what's stored in objects
+- `slots`: ordered `SlotSpec` list with index, byte offset, function VA, name
+- `has_itanium_header`: True when the 16 bytes before `va` look like offset-to-top=0 +
+ RTTI pointer standard Itanium ABI vtable layout
+- `ctor_sites`: VAs in the binary that reference this vtable VA (from relocations or
+ literal byte scan)
+- `section_name`: the ELF section name containing this vtable, e.g. `.rodata` or `.data`
+- `writable`: True when the containing section has `SHF_WRITE` set mutable at runtime
+
+### Layer 2: `name_slots(specs)`
+
+Names each slot in place. Attempts in order:
+
+1. Export / symtab symbol: direct match on `func_va`
+2. BinaryContext confirmed name: from prior RE session `ctx.set_name()` calls
+3. String literal xref: if the function body references a string like `"modexp"`,
+ the slot is named `"modexp"` filtered: no spaces, no `%`, 3–32 chars
+4. Named callee: if the function calls e.g. `BN_mod_exp`, the slot is named
+   `"mod_exp"` after stripping the `BN_` prefix
+
+The vtable type name is inferred from the longest common prefix of all named slots,
+e.g., `rsa_init` / `rsa_free` / `rsa_compute` → `rsa_vtable`.
+
+### Layer 3: `trace_consumers(spec)`
+
+Finds call sites that dispatch through any slot of `spec`.
+
+**x86-64:** delegates to `VtableDispatchScanner`; pattern-matches all
+`call [reg+slot_offset]` encodings REX prefix variants, disp8/disp32, SIB r12/rsp.
+Groups call sites by enclosing function using the binary's symbol table.
+
+**ARM64:** delegates to `vtable_resolver.detect_blr_sites()`; finds
+`LDR vptr / LDR slot / BLR` instruction windows.
+
+**Other architectures:** `trace_consumers()` returns `[]`; vtable extraction and naming
+work, call-site tracing is not yet implemented.
+
+---
+
+## IDAPython script
+
+`emit_ida_scriptspecs, propagation` generates a script that:
+
+1. Calls `idc.parse_decls()` with a C struct definition for each vtable
+2. Calls `idc.set_cmt()` at every ctor reference site (`"vptr → <type_name>"`)
+3. Calls `idc.set_cmt()` at every resolved call site (`"<type>-><slot>(...)"`)
+
+```python
+script = CppVtableReconstructorAnalyzer.emit_ida_script(
+    result.vtables, result.propagation)
+
+# Write to file for IDA
+with open('/tmp/vtable_types.py', 'w') as f:
+    f.write(script)
+```
+
+Paste into IDA's Python console or run via **File → Script file**. After the struct is
+declared, calling `idc.set_type()` on any producer function in IDA 8.x+ allows the
+decompiler to auto-propagate the struct type to local variables through the call graph.
+
+---
+
+## Output format
+
+```python
+@dataclass
+class VtableSpec:
+    va: int                 # vtable_ptr VA (vfunc[0])
+    slots: List[SlotSpec]   # ordered; slot_offset = slot_index * 8
+    type_name: str          # inferred, e.g. 'rsa_alg_vtable'
+    ctor_sites: List[int]   # VAs referencing this vtable in the binary
+    has_itanium_header: bool
+    section_name: str       # ELF section containing this vtable, e.g. '.rodata'
+    writable: bool          # True when section has SHF_WRITE (vtable is mutable at runtime)
+
+@dataclass
+class SlotSpec:
+    slot_index: int
+    slot_offset: int        # = slot_index * 8
+    func_va: int
+    func_name: str          # '' if unresolved
+    name_source: str        # 'export' | 'ctx_name' | 'string_xref' | 'callee_name' | 'unknown'
+
+@dataclass
+class TypePropSite:
+    func_va: int
+    func_name: str
+    role: str               # 'consumer'
+    slot_calls: List[Tuple[int, int, str]]
+    # each entry: (call_pc, slot_index, slot_name)
+```
+
+---
+
+## Example output
+
+```
+CppVtableReconstructorAnalyzer  /path/to/libossl.so
+arch=x86_64  vtables=3  slots=18  named=14  call_sites=27
+
+VTable  rsa_alg_vtable  @ 0x004a8200  [5 slots]  [Itanium ABI header]
+  vptr refs: 0x9f120, 0xa0340
+  slot  0  +0x000  0x00012340  init    [export]
+  slot  1  +0x008  0x00012380  clone   [export]
+  slot  2  +0x010  0x000124e0  free    [export]
+  slot  3  +0x018  0x00013450  modexp  [callee_name]
+  slot  4  +0x020  0x00013560  mul_mont[string_xref]
+
+Call Sites:
+  rsa_modexp_compute @ 0x00056780  [consumer]
+    0x000568a0  slot 3  → modexp
+    0x000568c4  slot 4  → mul_mont
+```
+
+---
+
+## Limitations
+
+- **ET_EXEC (non-PIE) binaries**: the byte scan fallback assumes `virtual_address ==
+ file_offset`. For executables loaded at a high base for example `0x400000`, the fallback
+ will produce incorrect file offsets. The RELA-based method works correctly regardless.
+- **Slot naming without ctx**: only export/symtab symbols are used. Pass a `BinaryContext`
+ for string-xref and callee-name naming.
+- **Consumer tracing on non-x86-64/ARM64**: returns empty; call-site tracing is not
+ implemented for LoongArch64, MIPS, PPC, etc.
+- **High FP rate on wide scan**: when `min_slots=1` and many vtables are in scope, the
+ VtableDispatchScanner call-site count grows because offset 0x00 / 0x08 appear in many
+ unrelated indirect calls. Restrict to a single vtable with `trace_consumers(spec)`.
+- **Stripped anonymous vtables**: vtables without any context (no exports, no strings, no
+ BinaryContext) remain as `vtable_XXXXXXXX` with unnamed slots. Run `name_slots()` again
+ after accumulating confirmed function names via `ctx.set_name()`.
+
+---
+
+## Release notes
+
+Added in v2.41.0. v2.49.0 adds `VtableSpec.section_name` and `VtableSpec.writable` fields
+populated by all three scan paths RELA-based, byte-scan, and the `_make_spec_from_run` helper.
+A vtable in `.data` with `writable=True` means any kernel or process write primitive reaching
+the vtable data can redirect virtual dispatch. Normal vtables live in `.rodata` or `.data.rel.ro`
+read-only after RELRO.
+
+## FORGE audit
+
+Gate: **PASSED**. No HIGH or CRITICAL findings. `_MAX_ELF_BYTES=256MB` + `os.path.getsize()` guard in `__init__()`; `lief.parse()` in `try/except Exception` + `if parsed is None` check.
+
+---
+
+## How it works
+
+`CppVtableReconstructorAnalyzer.scan()` runs a 3-layer pipeline. **Layer 1** `scan_vtables()` extracts vtable structures via RELA relocations dynamic ELF or raw code-pointer scan fallback. No func_starts iteration. **Layer 2** `name_slots()` resolves each slot to a name via export symbols and string xrefs. **Layer 3** `trace_consumers()` finds call sites dispatching through vtable slots: x86-64 via `VtableDispatchScanner`, ARM64 via `vtable_resolver`, other arches via pointer-literal scan. Consumer tracing uses `_func_starts_sorted()` internally.
+
+---
+
+## False positives
+
+The most common false positive is a tainted argument that is immediately sanitized by the callee before use. Run `SinkSanitizerFilter` on all HIGH findings before manual review. Call sites where the argument is loaded from `.rodata` are not findings: `SinkArgClassifier` classifies these as `RODATA_CONST` and they should be excluded before the scanner runs.
+
+---
+
+## Pipeline position
+
+**Before this module:** `BinaryContext.load_or_build()` and `SemanticSearcher.query()` to identify candidate functions. Run `SinkArgClassifier` first to eliminate `RODATA_CONST` call sites before passing candidates here.
+
+**After this module:** Confirm feasibility with `PathSolver`. Register confirmed findings with `FindingRegistry`.
+
+---
+
+## Reading output
+
+`CppVtableReconstructor.from_context(ctx).reconstruct()` returns a `VtableReconstructorResult`:
+
+| Attribute | Content |
+|:---|:---|
+| `vtables` | `List[VtableSpec]`: one entry per reconstructed C++ vtable |
+| `propagation` | `List[TypePropSite]`: functions identified as vtable type consumers |
+| `binary_path` | Path of the analyzed binary |
+| `arch` | Architecture string for example `'x86_64'`, `'aarch64'` |
+| `named_slot_count` | Number of vtable slots with resolved function names |
+| `total_slot_count` | Total vtable slots across all reconstructed vtables |
+| `resolved_call_count` | Number of virtual dispatch call sites successfully resolved |
+
+Each `VtableSpec` has: `va`, `slots: List[SlotSpec]`, `type_name`, `ctor_sites: List[int]`, `section_name`, `writable: bool`.
+
+Each `SlotSpec` has: `slot_index`, `slot_offset`, `func_va`, `func_name`, `name_source`.
+
+---
+
+## See also
+
+- [BinaryContext](binary-context.md): function and import resolution before scanning
+- [SinkArgClassifier](sink-arg-classifier.md): eliminate RODATA_CONST call sites before taint
+- [TaintAnalysis](taint-analysis.md): confirm propagation from source to flagged sink
+- [Exploit Path Validation](finding-validation.md): verify path feasibility for confirmed candidates
+- [FindingRegistry](registry.md): record confirmed findings

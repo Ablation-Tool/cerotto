@@ -1,0 +1,249 @@
+# RH850TaintTracker
+
+**File:** `ablation/analyzers/taint_tracker_rh850.py`
+
+---
+
+## What this is
+
+Renesas RH850 is the dominant MCU family in automotive ECUs from Denso, Continental, and Bosch suppliers. Firmware ships as both flat ROM dumps and ELF binaries. GHS MULTI compiles most production RH850 firmware with a different ABI than GCC's V850 ABI: `double` is 32 bits by default and every C symbol carries a leading underscore prefix. `RH850TaintTracker` handles flat ROM images and ELF binaries, models the GHS ABI correctly, and normalizes GHS symbol mangling so CAN-controlled taint paths trace correctly through production automotive firmware.
+
+---
+
+## Where it's used
+
+- **Denso and Continental ECUs**: RH850 firmware compiled with GHS MULTI
+- **Bosch supplier ECUs**: RH850 ELF and flat ROM images from automotive vendors
+- Any binary where `EcuArchDetector` returns `rh850`
+
+---
+
+## Safe usage
+
+**Use `from_bytesdata, base_va` for flat ROM dumps.** `from_path()` requires an ELF header. Raw ECU firmware images have no ELF header so `from_path()` raises. Pass the raw bytes and a base address instead.
+
+**Set `double_is_32bit=False` only if the ECU was compiled with `--double=64`.** The default GHS RH850 ABI uses 32-bit doubles. Mismatching the flag shifts argument registers and produces wrong taint assignments for any function taking a `double` parameter.
+
+**Use C-level names without leading underscores for custom sinks.** GHS renames `recv` to `_recv` in ELF symbol tables. The tracker normalizes this automatically. Custom sinks passed as strings need the C-level name, not the mangled form.
+
+**Supply function boundaries from `EcuArchDetector` or `FlatBinaryFuncStartScanner` before calling `scan_function()`.** Passing wrong boundaries causes the tracker to walk past the function end and produce findings at wrong addresses.
+
+---
+
+## Why this exists
+
+Three things were not possible before in Ablation:
+
+**1. No flat-ROM / `from_bytes` support for RH850 ECU firmware.** Automotive RH850
+ECU images are frequently shipped as raw binary dumps with no ELF header. `V850TaintTracker` requires `from_path(elf)` and will
+raise on a bare binary. `RH850TaintTracker.from_bytesdata, base_va` +
+`scan_functionfunc_va, func_end, init_labels` gives the same flat-ROM scanning
+workflow as `TriCoreTaintTracker`.
+
+**2. GHS CC-RH / IAR `double=32-bit` default not modelled.** In the IAR RH850 ABI
+§2.7 of GHS-RE-REFERENCE.md, `double` is 32 bits by default: identical to
+`float`. `V850TaintTracker` uses the GCC V850 ABI where `double=64-bit` consumes
+a register pair (R6:R7 for the first `double` parameter). In GHS-compiled firmware,
+that same parameter fits in R6 alone, leaving R7 free for the next argument.
+Without the `double_is_32bit` flag, an analyst reading a finding that says "r7
+tainted" might misinterpret it as the high half of a 64-bit double rather than an
+independent tainted argument. `RH850TaintTracker` stores this flag on the tracker
+and propagates it into every `TaintFindingRH850` and the `report()` output.
+
+**3. GHS old-style symbol mangling `__ct`, `__dt`, and `__vtbl` not handled.**
+GHS MULTI uses GCC 2.9.x / ARM libiberty mangling (not Itanium ABI `_Z...`).
+Constructors appear as `Foo__ct`, destructors as `Foo__dt`, vtable symbols as
+`__vtblFoo`. Renesas assembler additionally prepends a leading `_` to every C symbol, so `recv` appears as `_recv` in ELF exports. `V850TaintTracker`'s source/sink resolver compares
+raw ELF symbol names against C-level source/sink sets, so `_recv` is not matched
+as `recv` and `Foo__ct` is not matched at all. `RH850TaintTracker` applies
+`_ghs_c_name()` normalisation at every call site before checking source/sink
+membership, so all GHS-mangled variants resolve correctly.
+
+---
+
+## ABI summary GHS CC-RH / IAR RH850, GHS-RE-REFERENCE.md §2.2-2.4
+
+| Role | Registers |
+|---|---|
+| Argument registers | R6, R7, R8, R9 |
+| Return value (32-bit) | R10 |
+| Return value (64-bit) | R10:R11 |
+| Link register | R31 = LP |
+| Stack pointer | R3 = SP |
+| Global pointer | R4 = GP never modify |
+| Table pointer | R5 = TP never modify |
+| Element pointer | R30 = EP preserved |
+| Caller-saved | R1, R6–R19, LP |
+| Callee-saved | R2, R4 (GP), R5 (TP), R20–R29, EP |
+
+**`double` type (§2.7):** 32-bit by default (`double_is_32bit=True`).
+Set `double_is_32bit=False` if firmware was compiled with `--double=64`.
+
+---
+
+## Usage
+
+```python
+from ablation.analyzers.taint_tracker_rh850 import RH850TaintTracker
+
+# --- Flat ROM dump ---
+data = open('denso_gs327.bin', 'rb').read()
+tracker = RH850TaintTracker.from_bytes(data, base_va=0x0)
+
+# Scan one function (boundaries from EcuArchDetector / FlatBinaryFuncStartScanner)
+findings = tracker.scan_function(
+    func_va=0x0000_8200,
+    func_end=0x0000_8400,
+    init_labels={'can_payload'},
+)
+print(tracker.report(findings))
+
+# --- ELF binary ---
+tracker = RH850TaintTracker.from_path('firmware.elf')
+findings = tracker.run()                      # intraprocedural
+chains   = tracker.run_interprocedural(depth=4)
+print(tracker.report(chains))
+
+# --- Compiled with --double=64 ---
+tracker = RH850TaintTracker.from_path('fw64.elf', double_is_32bit=False)
+```
+
+---
+
+## Constructor parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `data` |: | Raw binary bytes |
+| `base_va` | `0x0` | Load address of first byte flat ROM |
+| `double_is_32bit` | `True` | GHS/IAR default: `double` = 32-bit |
+
+`from_path(elf)` auto-detects text section VA and endianness from lief/pyelftools.
+
+---
+
+## TaintFindingRH850 fields
+
+```python
+@dataclass
+class TaintFindingRH850:
+    func_va:         int         # VA of the containing function
+    func_name:       str         # symbol name or fn_0xNNNN
+    sink_va:         int         # VA of the dangerous call/store
+    sink_name:       str         # C-level sink name (GHS-normalised)
+    tainted_args:    List[str]   # register names tainted at call site
+    source_name:     str         # label of origin source function
+    severity:        str         # 'CRITICAL' or 'HIGH'
+    double_is_32bit: bool        # reflects tracker's ABI flag
+```
+
+---
+
+## GHS symbol normaliser
+
+`_ghs_c_name(sym)` maps any GHS/Renesas symbol to its C-level name:
+
+| Input | Output | Rule |
+|---|---|---|
+| `_recv` | `recv` | Renesas assembler underscore prefix (§2.10) |
+| `Foo__ctFv` | `Foo` | GHS constructor mangling |
+| `Bar__dt` | `Bar` | GHS destructor mangling |
+| `__vtblSocket` | `Socket` | vtable symbol |
+| `memcpy` | `memcpy` | no mangling pass-through |
+
+`_ghs_name_insym, name_set` is the preferred helper: returns `True` if `sym`
+or its GHS-normalised form is in `name_set`.
+
+---
+
+## `double=32-bit` ABI detail
+
+GHS CC-RH and IAR default to `double=32-bit` IEC 60559 single precision.
+Practical consequence for taint tracking:
+
+```
+GCC V850 ABI (double=64-bit):
+  f(double d, int n) → R6:R7 = d, R8 = n
+                        first tainted "arg" at sink uses R6 AND R7
+
+GHS CC-RH ABI (double=32-bit, DEFAULT):
+  f(double d, int n) → R6 = d, R7 = n
+                        first tainted "arg" at sink uses R6 only
+```
+
+A finding that names `r7` as tainted at a sink means different things in
+the two ABIs. The `[double=32b]` annotation in finding strings and the
+`report()` header ensures the analyst can immediately see which model applies.
+
+---
+
+## Limitations
+
+- Capstone does not support V850/RH850; a custom byte-level decoder V850Decoder
+ is used. Instruction decoding quality depends on the V850Decoder's opcode
+ coverage for the specific RH850 variant.
+- `scan_function` requires caller-supplied function boundaries (no automatic
+ function boundary detection in flat ROM mode).
+- `__callt` / `__interrupt` / `__trap` special function types (§2.11) are not
+ modelled; these have non-standard return mechanisms CTRET, EIRET, FERET and
+ no scratch-register semantics. CALLT appears as an unknown call site.
+- GHS `__vtbl` symbols are call-target normalised but vtable dispatch itself
+ indirect call through vtable pointer is not tracked.
+- Loop fixpoint is not computed: taint accumulated on the second loop iteration
+ is not propagated to later instructions.
+
+---
+
+## How it works
+
+Seeds the worklist with every call site of each configured source function. For each seeded location, a linear Capstone disassembly pass applies the taint lattice rules instruction by instruction, propagating taint through register moves, arithmetic, and memory operations. When a call instruction targets a PLT stub that resolves to a sink function and the relevant argument register is tainted, a `TaintFinding` is emitted. Internal calls push a new entry onto the worklist so taint follows the call graph interprocedurally up to `max_depth` levels.
+
+---
+
+## Example output
+
+```
+[CRITICAL] system() at 0x4023A0
+  source:   recv() at 0x401F00
+  arg:      rdi (arg 0)
+  chain:    recv→rdi → strcpy buf → system rdi
+  path:     [0x401F00, 0x4020C0, 0x4023A0]
+  severity: CRITICAL (exec sink, externally controlled argument)
+```
+
+---
+
+## False positives
+
+The most common false positive is taint surviving a zero-clear instruction (`xor rax, rax`). The `CLR` rule in the taint lattice clears taint unconditionally on self-XOR, but some architectures use different clearing idioms. Use `SinkArgClassifier` to pre-filter `RODATA_CONST` call sites before running the taint tracker, these are not findings regardless of register state.
+
+---
+
+## Pipeline position
+
+**Before this module:** `BinaryContext.load_or_build()`, then `SinkArgClassifier.classify_all()` to eliminate `RODATA_CONST` call sites. Only pass `ARG_PROPAGATED` and `UNKNOWN` sinks to the taint tracker.
+
+**After this module:** `PathSolver` to confirm path feasibility. `FindingRegistry.register()` to record confirmed findings.
+
+---
+
+## Reading findings
+
+| Field | Content |
+|:---|:---|
+| `sink_name` | Name of the dangerous function reached |
+| `sink_va` | Virtual address of the call site |
+| `source_name` | Name of the taint source such as `recv` and `read` |
+| `arg_index` | Which argument to the sink carries taint 0-indexed |
+| `chain` | `[va, register, operation]` steps from source to sink |
+| `path` | `[caller_va, ...]` function VAs traversed interprocedurally |
+| `severity` | `CRITICAL` for exec sinks, `HIGH` for memory sinks |
+
+---
+
+## See also
+
+- [TaintAnalysis](taint-analysis.md): multi-architecture taint tracking reference
+- [SinkArgClassifier](sink-arg-classifier.md): pre-filter RODATA_CONST sinks before taint
+- [PathSolver](path-solver.md): confirm path feasibility after a taint hit
+- [SinkPropagator](sink-propagator.md): extend sink coverage across wrappers
